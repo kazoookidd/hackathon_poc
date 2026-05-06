@@ -2,6 +2,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -282,6 +283,18 @@ class SelectedTaskEditResponse(BaseModel):
     attack_plan: Optional[AttackPlan] = None
     calendar: Optional[List[CalendarEvent]] = None
     reminders: Optional[List[Reminder]] = None
+
+
+class FocusCheckRequest(BaseModel):
+    custom_blocked_keywords: Optional[List[str]] = None
+
+
+class FocusCheckResponse(BaseModel):
+    status: str
+    detected_apps: List[str]
+    detected_processes: List[str]
+    checked_at: str
+    message: str
 
 
 # ------------------------
@@ -803,6 +816,55 @@ def heuristic_plan_assistant(tasks_text: str):
     return {"status": "ready", "summary": "Plan généré.", "questions": [], "tasks": tasks}
 
 
+DEFAULT_DISTRACTION_KEYWORDS = [
+    # Jeux / plateformes
+    "steam",
+    "epicgameslauncher",
+    "riotclientservices",
+    "leagueclient",
+    "minecraft",
+    "dota",
+    "cs2",
+    "fortnite",
+    "valorant",
+    # Réseaux / divertissement
+    "discord",
+    "telegram",
+    "whatsapp",
+    "instagram",
+    "facebook",
+    "x.com",
+    "twitter",
+    "tiktok",
+    "snapchat",
+    "youtube",
+    "twitch",
+    "netflix",
+]
+
+
+def list_running_process_lines() -> List[str]:
+    try:
+        result = subprocess.run(["ps", "-eo", "comm,args"], capture_output=True, text=True, timeout=5)
+        if result.returncode != 0:
+            return []
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        return lines[1:] if len(lines) > 1 else []
+    except Exception:
+        return []
+
+
+def detect_distraction_processes(custom_keywords: Optional[List[str]] = None) -> List[str]:
+    keywords = [k.lower().strip() for k in (custom_keywords or DEFAULT_DISTRACTION_KEYWORDS) if str(k).strip()]
+    processes = list_running_process_lines()
+    detected: List[str] = []
+    for proc in processes:
+        low = proc.lower()
+        if any(keyword in low for keyword in keywords):
+            detected.append(proc)
+    return detected[:20]
+
+
 def generate_tasks(goal: str):
     if USE_OLLAMA:
         tasks = generate_tasks_ollama(goal)
@@ -1178,6 +1240,27 @@ def modify_selected_tasks(data: SelectedTaskEditRequest):
         )
         conn.commit()
     return result
+
+
+@app.post("/focus/check-apps", response_model=FocusCheckResponse, tags=["Focus"])
+def check_focus_apps(data: FocusCheckRequest):
+    detected_processes = detect_distraction_processes(data.custom_blocked_keywords)
+    app_names: List[str] = []
+    for proc in detected_processes:
+        app_names.append(proc.split(" ", 1)[0])
+    deduped_apps = list(dict.fromkeys(app_names))[:10]
+    has_distraction = len(detected_processes) > 0
+    return {
+        "status": "distraction_detected" if has_distraction else "focused",
+        "detected_apps": deduped_apps,
+        "detected_processes": detected_processes,
+        "checked_at": datetime.now().isoformat(),
+        "message": (
+            "Attention: une application distractive est lancée. Reviens sur ton objectif."
+            if has_distraction
+            else "Excellent, aucune app distractive détectée. Continue comme ça."
+        ),
+    }
 
 
 @app.post("/admin/reset-site", tags=["Admin"])

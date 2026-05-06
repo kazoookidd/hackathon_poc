@@ -10,6 +10,13 @@ type PlannerMessage = { role: "user" | "assistant"; content: string };
 type AttackPlan = { objective: string; steps: string[] };
 type CalendarEvent = { task_id: number; title: string; when: string };
 type Reminder = { when: string; message: string };
+type FocusCheckResponse = {
+  status: "focused" | "distraction_detected";
+  detected_apps: string[];
+  detected_processes: string[];
+  checked_at: string;
+  message: string;
+};
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const initialForm = { email: "", password: "", first_name: "", last_name: "", age: 18, profession: "", goal: "" };
@@ -45,6 +52,14 @@ export default function Home() {
   const [plannerMessages, setPlannerMessages] = useState<PlannerMessage[]>([]);
   const [plannerInput, setPlannerInput] = useState("");
   const [plannerLoading, setPlannerLoading] = useState(false);
+  const [focusShieldEnabled, setFocusShieldEnabled] = useState(false);
+  const [alarmEnabled, setAlarmEnabled] = useState(true);
+  const [blockedKeywordsInput, setBlockedKeywordsInput] = useState("discord, steam, youtube, twitch, tiktok, instagram");
+  const [focusStatus, setFocusStatus] = useState<"idle" | "focused" | "distraction_detected">("idle");
+  const [detectedApps, setDetectedApps] = useState<string[]>([]);
+  const [focusXp, setFocusXp] = useState(0);
+  const [focusStreak, setFocusStreak] = useState(0);
+  const [focusFunMessage, setFocusFunMessage] = useState("Active le Focus Shield pour détecter les apps distrayantes.");
   const totalMicro = useMemo(() => tasks.reduce((sum, t) => sum + (t.microtasks?.length || 0), 0), [tasks]);
   const totalUnits = useMemo(() => tasks.length + totalMicro, [tasks.length, totalMicro]);
   const completedUnits = useMemo(() => done.length + doneMicro.length, [done.length, doneMicro.length]);
@@ -75,6 +90,14 @@ export default function Home() {
       if (parsed.attackPlan) setAttackPlan(parsed.attackPlan);
       if (Array.isArray(parsed.calendarEvents)) setCalendarEvents(parsed.calendarEvents);
       if (Array.isArray(parsed.reminders)) setReminders(parsed.reminders);
+      if (typeof parsed.focusShieldEnabled === "boolean") setFocusShieldEnabled(parsed.focusShieldEnabled);
+      if (typeof parsed.alarmEnabled === "boolean") setAlarmEnabled(parsed.alarmEnabled);
+      if (typeof parsed.blockedKeywordsInput === "string") setBlockedKeywordsInput(parsed.blockedKeywordsInput);
+      if (parsed.focusStatus) setFocusStatus(parsed.focusStatus);
+      if (Array.isArray(parsed.detectedApps)) setDetectedApps(parsed.detectedApps);
+      if (typeof parsed.focusXp === "number") setFocusXp(parsed.focusXp);
+      if (typeof parsed.focusStreak === "number") setFocusStreak(parsed.focusStreak);
+      if (typeof parsed.focusFunMessage === "string") setFocusFunMessage(parsed.focusFunMessage);
     } catch {
       // ignore corrupted cache
     }
@@ -82,9 +105,46 @@ export default function Home() {
 
   useEffect(() => {
     if (!cacheKey) return;
-    const payload = { goal, tasks, done, doneMicro, messages, plannerMessages, attackPlan, calendarEvents, reminders };
+    const payload = {
+      goal,
+      tasks,
+      done,
+      doneMicro,
+      messages,
+      plannerMessages,
+      attackPlan,
+      calendarEvents,
+      reminders,
+      focusShieldEnabled,
+      alarmEnabled,
+      blockedKeywordsInput,
+      focusStatus,
+      detectedApps,
+      focusXp,
+      focusStreak,
+      focusFunMessage,
+    };
     localStorage.setItem(cacheKey, JSON.stringify(payload));
-  }, [cacheKey, goal, tasks, done, doneMicro, messages, plannerMessages, attackPlan, calendarEvents, reminders]);
+  }, [
+    cacheKey,
+    goal,
+    tasks,
+    done,
+    doneMicro,
+    messages,
+    plannerMessages,
+    attackPlan,
+    calendarEvents,
+    reminders,
+    focusShieldEnabled,
+    alarmEnabled,
+    blockedKeywordsInput,
+    focusStatus,
+    detectedApps,
+    focusXp,
+    focusStreak,
+    focusFunMessage,
+  ]);
 
   useEffect(() => {
     if (!userId) return;
@@ -117,6 +177,73 @@ export default function Home() {
       // keep app usable even if persistence fails
     }
   };
+
+  const playAlarm = () => {
+    try {
+      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const oscillator = ctx.createOscillator();
+      const gainNode = ctx.createGain();
+      oscillator.type = "sawtooth";
+      oscillator.frequency.setValueAtTime(880, ctx.currentTime);
+      oscillator.frequency.exponentialRampToValueAtTime(440, ctx.currentTime + 0.6);
+      gainNode.gain.setValueAtTime(0.0001, ctx.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.05);
+      gainNode.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.7);
+      oscillator.connect(gainNode);
+      gainNode.connect(ctx.destination);
+      oscillator.start();
+      oscillator.stop(ctx.currentTime + 0.72);
+    } catch {
+      // silent fail
+    }
+  };
+
+  const checkFocusApps = async () => {
+    if (!focusShieldEnabled || !userId) return;
+    try {
+      const custom = blockedKeywordsInput
+        .split(/[,|\n]/)
+        .map((k) => k.trim())
+        .filter(Boolean);
+      const res = await fetch(`${API}/focus/check-apps`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ custom_blocked_keywords: custom }),
+      });
+      const data = (await res.json()) as FocusCheckResponse;
+      if (!res.ok) throw new Error(data.message || "Erreur de surveillance focus");
+      setDetectedApps(Array.isArray(data.detected_apps) ? data.detected_apps : []);
+      if (data.status === "distraction_detected") {
+        setFocusStatus("distraction_detected");
+        setFocusStreak(0);
+        setFocusFunMessage(`Alerte Focus: ${data.detected_apps.join(", ") || "app distractive"} détectée. Ferme-la et reprends ton objectif.`);
+        if (alarmEnabled) playAlarm();
+      } else {
+        setFocusStatus("focused");
+        setFocusStreak((prev) => prev + 1);
+        setFocusXp((prev) => prev + 5);
+        const funLines = [
+          "Mode ninja activé: +5 XP focus.",
+          "Ton cerveau est en zone de combat productive.",
+          "Combo focus maintenu, continue.",
+        ];
+        setFocusFunMessage(funLines[Math.floor(Math.random() * funLines.length)]);
+      }
+    } catch (err) {
+      setFocusFunMessage(err instanceof Error ? err.message : "Erreur de surveillance Focus Shield.");
+    }
+  };
+
+  useEffect(() => {
+    if (!focusShieldEnabled || !userId) return;
+    void checkFocusApps();
+    const timer = setInterval(() => {
+      void checkFocusApps();
+    }, 12000);
+    return () => clearInterval(timer);
+  }, [focusShieldEnabled, userId, blockedKeywordsInput, alarmEnabled]);
 
   const onAuth = async (e: FormEvent) => {
     e.preventDefault();
@@ -318,6 +445,13 @@ export default function Home() {
     setAttackPlan(null);
     setCalendarEvents([]);
     setReminders([]);
+    setFocusShieldEnabled(false);
+    setAlarmEnabled(true);
+    setDetectedApps([]);
+    setFocusStatus("idle");
+    setFocusXp(0);
+    setFocusStreak(0);
+    setFocusFunMessage("Active le Focus Shield pour détecter les apps distrayantes.");
     if (cacheKey) localStorage.removeItem(cacheKey);
   };
 
@@ -447,6 +581,41 @@ export default function Home() {
               <button onClick={modifySelectedTasksWithAI} style={{ ...primaryButton, width: "fit-content" }} disabled={plannerLoading}>
                 {plannerLoading ? "Modification..." : "Modifier uniquement les tâches sélectionnées"}
               </button>
+            </div>
+
+            <div style={{ marginTop: 14, border: "1px solid #2d3f66", borderRadius: 12, padding: 10, background: "#111a30", display: "grid", gap: 8 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+                <div style={{ fontSize: 13, color: "#aac1f4" }}>Focus Shield (anti distractions)</div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button
+                    onClick={() => setFocusShieldEnabled((v) => !v)}
+                    style={{ ...primaryButton, background: focusShieldEnabled ? "linear-gradient(90deg,#2aa85f,#1f7e4a)" : "#384665" }}
+                  >
+                    {focusShieldEnabled ? "Désactiver shield" : "Activer shield"}
+                  </button>
+                  <button
+                    onClick={() => setAlarmEnabled((v) => !v)}
+                    style={{ ...primaryButton, background: alarmEnabled ? "linear-gradient(90deg,#ff6b6b,#ff8f5b)" : "#384665" }}
+                  >
+                    {alarmEnabled ? "Alarme ON" : "Alarme OFF"}
+                  </button>
+                  <button onClick={() => void checkFocusApps()} style={{ ...primaryButton, background: "#2b3d63" }}>
+                    Vérifier maintenant
+                  </button>
+                </div>
+              </div>
+              <input
+                value={blockedKeywordsInput}
+                onChange={(e) => setBlockedKeywordsInput(e.target.value)}
+                placeholder="Mots-clés bloqués, séparés par des virgules (ex: discord, steam, youtube)"
+                style={inputStyle}
+              />
+              <div style={{ fontSize: 13, color: focusStatus === "distraction_detected" ? "#ffb4b4" : "#b5ffd8" }}>
+                {focusStatus === "distraction_detected" ? "🚨 Distraction détectée" : focusStatus === "focused" ? "🛡️ Focus propre" : "⏸️ Shield en attente"}
+              </div>
+              {!!detectedApps.length && <div style={{ fontSize: 13, color: "#ffd38a" }}>Apps détectées: {detectedApps.join(", ")}</div>}
+              <div style={{ fontSize: 13, color: "#9fc4ff" }}>XP Focus: {focusXp} | Streak: {focusStreak}</div>
+              <div style={{ fontSize: 13, color: "#c8d9ff" }}>{focusFunMessage}</div>
             </div>
 
             {(attackPlan || calendarEvents.length > 0 || reminders.length > 0) && (
