@@ -55,6 +55,7 @@ export default function Home() {
   const [focusShieldEnabled, setFocusShieldEnabled] = useState(false);
   const [alarmEnabled, setAlarmEnabled] = useState(true);
   const [blockedKeywordsInput, setBlockedKeywordsInput] = useState("discord, steam, youtube, twitch, tiktok, instagram");
+  const [allowedApps, setAllowedApps] = useState<string[]>([]);
   const [focusStatus, setFocusStatus] = useState<"idle" | "focused" | "distraction_detected">("idle");
   const [detectedApps, setDetectedApps] = useState<string[]>([]);
   const [focusXp, setFocusXp] = useState(0);
@@ -96,6 +97,7 @@ export default function Home() {
       if (typeof parsed.focusShieldEnabled === "boolean") setFocusShieldEnabled(parsed.focusShieldEnabled);
       if (typeof parsed.alarmEnabled === "boolean") setAlarmEnabled(parsed.alarmEnabled);
       if (typeof parsed.blockedKeywordsInput === "string") setBlockedKeywordsInput(parsed.blockedKeywordsInput);
+      if (Array.isArray(parsed.allowedApps)) setAllowedApps(parsed.allowedApps);
       if (parsed.focusStatus) setFocusStatus(parsed.focusStatus);
       if (Array.isArray(parsed.detectedApps)) setDetectedApps(parsed.detectedApps);
       if (typeof parsed.focusXp === "number") setFocusXp(parsed.focusXp);
@@ -123,6 +125,7 @@ export default function Home() {
       focusShieldEnabled,
       alarmEnabled,
       blockedKeywordsInput,
+      allowedApps,
       focusStatus,
       detectedApps,
       focusXp,
@@ -146,6 +149,7 @@ export default function Home() {
     focusShieldEnabled,
     alarmEnabled,
     blockedKeywordsInput,
+    allowedApps,
     focusStatus,
     detectedApps,
     focusXp,
@@ -223,13 +227,16 @@ export default function Home() {
       });
       const data = (await res.json()) as FocusCheckResponse;
       if (!res.ok) throw new Error(data.message || "Erreur de surveillance focus");
-      setDetectedApps(Array.isArray(data.detected_apps) ? data.detected_apps : []);
-      if (data.status === "distraction_detected") {
+      const detected = Array.isArray(data.detected_apps) ? data.detected_apps : [];
+      const allowedSet = new Set(allowedApps.map((a) => a.toLowerCase().trim()));
+      const activeDetected = detected.filter((app) => !allowedSet.has(app.toLowerCase().trim()));
+      setDetectedApps(activeDetected);
+      if (activeDetected.length > 0) {
         setFocusStatus("distraction_detected");
         setFocusStreak(0);
         setFocusLockActive(true);
         setFocusLockUntil(Date.now() + 60000);
-        setFocusFunMessage(`Alerte Focus: ${data.detected_apps.join(", ") || "app distractive"} détectée. Ferme-la et reprends ton objectif.`);
+        setFocusFunMessage(`Alerte Focus: ${activeDetected.join(", ") || "app distractive"} détectée. Ferme-la et reprends ton objectif.`);
         if (alarmEnabled) playAlarm();
         return "distraction_detected";
       } else {
@@ -248,6 +255,19 @@ export default function Home() {
       setFocusFunMessage(err instanceof Error ? err.message : "Erreur de surveillance Focus Shield.");
       return "idle";
     }
+  };
+
+  const allowDetectedApp = (app: string) => {
+    const normalized = app.trim().toLowerCase();
+    if (!normalized) return;
+    setAllowedApps((prev) => (prev.includes(normalized) ? prev : [...prev, normalized]));
+    setDetectedApps((prev) => prev.filter((a) => a.toLowerCase().trim() !== normalized));
+    setFocusFunMessage(`App autorisée temporairement: ${normalized}`);
+  };
+
+  const removeAllowedApp = (app: string) => {
+    const normalized = app.trim().toLowerCase();
+    setAllowedApps((prev) => prev.filter((a) => a !== normalized));
   };
 
   const remainingLockSeconds = useMemo(() => {
@@ -285,7 +305,7 @@ export default function Home() {
       void checkFocusApps();
     }, 12000);
     return () => clearInterval(timer);
-  }, [focusShieldEnabled, userId, blockedKeywordsInput, alarmEnabled]);
+  }, [focusShieldEnabled, userId, blockedKeywordsInput, alarmEnabled, allowedApps]);
 
   useEffect(() => {
     if (!focusShieldEnabled) {
@@ -497,6 +517,7 @@ export default function Home() {
     setFocusShieldEnabled(false);
     setAlarmEnabled(true);
     setDetectedApps([]);
+    setAllowedApps([]);
     setFocusStatus("idle");
     setFocusXp(0);
     setFocusStreak(0);
@@ -694,6 +715,35 @@ export default function Home() {
                 {focusStatus === "distraction_detected" ? "🚨 Distraction détectée" : focusStatus === "focused" ? "🛡️ Focus propre" : "⏸️ Shield en attente"}
               </div>
               {!!detectedApps.length && <div style={{ fontSize: 13, color: "#ffd38a" }}>Apps détectées: {detectedApps.join(", ")}</div>}
+              {!!detectedApps.length && (
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {detectedApps.map((app) => (
+                    <button
+                      key={`allow-${app}`}
+                      onClick={() => allowDetectedApp(app)}
+                      style={{ background: "#304a2f", border: "1px solid #4f7b4b", color: "#d9ffd2", borderRadius: 999, padding: "0.2rem 0.55rem", cursor: "pointer", fontSize: 12 }}
+                    >
+                      Autoriser {app}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {!!allowedApps.length && (
+                <div style={{ display: "grid", gap: 4 }}>
+                  <div style={{ fontSize: 12, color: "#9dc0ff" }}>Apps autorisées temporairement</div>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    {allowedApps.map((app) => (
+                      <button
+                        key={`allowed-${app}`}
+                        onClick={() => removeAllowedApp(app)}
+                        style={{ background: "#2b3654", border: "1px solid #4a6397", color: "#d9e6ff", borderRadius: 999, padding: "0.2rem 0.55rem", cursor: "pointer", fontSize: 12 }}
+                      >
+                        {app} (re-bloquer)
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
               <div style={{ fontSize: 13, color: "#9fc4ff" }}>XP Focus: {focusXp} | Streak: {focusStreak}</div>
               <div style={{ fontSize: 13, color: "#c8d9ff" }}>{focusFunMessage}</div>
             </div>
