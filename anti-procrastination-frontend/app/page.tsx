@@ -25,6 +25,8 @@ export default function Home() {
   const [isTyping, setIsTyping] = useState(false);
   const [goal, setGoal] = useState("");
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [selectedTaskIds, setSelectedTaskIds] = useState<number[]>([]);
+  const [batchEditInput, setBatchEditInput] = useState("");
   const [editingTaskId, setEditingTaskId] = useState<number | null>(null);
   const [taskDraft, setTaskDraft] = useState<{ title: string; duration: number; explanation: string; microtasksText: string }>({
     title: "",
@@ -74,6 +76,35 @@ export default function Home() {
     const payload = { goal, tasks, done, doneMicro, messages, plannerMessages };
     localStorage.setItem(cacheKey, JSON.stringify(payload));
   }, [cacheKey, goal, tasks, done, doneMicro, messages, plannerMessages]);
+
+  useEffect(() => {
+    if (!userId) return;
+    const loadSavedPlan = async () => {
+      try {
+        const res = await fetch(`${API}/users/${userId}/plan`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (typeof data.goal === "string") setGoal(data.goal);
+        if (Array.isArray(data.tasks)) setTasks(data.tasks);
+      } catch {
+        // ignore when there is no saved plan yet
+      }
+    };
+    void loadSavedPlan();
+  }, [userId]);
+
+  const savePlanToServer = async (nextGoal: string, nextTasks: Task[]) => {
+    if (!userId) return;
+    try {
+      await fetch(`${API}/users/${userId}/plan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ goal: nextGoal, tasks: nextTasks }),
+      });
+    } catch {
+      // keep app usable even if persistence fails
+    }
+  };
 
   const onAuth = async (e: FormEvent) => {
     e.preventDefault();
@@ -131,9 +162,12 @@ export default function Home() {
       const summary = data.summary || "Analyse du plan effectuée.";
       const nextTasks = (data.tasks || []) as Task[];
       if (nextTasks.length > 0) {
-        setTasks(nextTasks.map((t: Task, i: number) => ({ ...t, id: i + 1 })));
+        const normalizedTasks = nextTasks.map((t: Task, i: number) => ({ ...t, id: i + 1 }));
+        setTasks(normalizedTasks);
+        setSelectedTaskIds([]);
         setDone([]);
         setDoneMicro([]);
+        await savePlanToServer(goal, normalizedTasks);
       }
       if (data.status === "needs_clarification") {
         const questions = (data.questions || []) as string[];
@@ -177,8 +211,8 @@ export default function Home() {
 
   const saveTaskEdit = () => {
     if (editingTaskId === null) return;
-    setTasks((prev) =>
-      prev.map((t) =>
+    setTasks((prev) => {
+      const updatedTasks = prev.map((t) =>
         t.id === editingTaskId
           ? {
               ...t,
@@ -191,9 +225,60 @@ export default function Home() {
                 .filter(Boolean),
             }
           : t
-      )
-    );
+      );
+      void savePlanToServer(goal, updatedTasks);
+      return updatedTasks;
+    });
     setEditingTaskId(null);
+  };
+
+  const toggleTaskSelection = (taskId: number) => {
+    setSelectedTaskIds((prev) => (prev.includes(taskId) ? prev.filter((id) => id !== taskId) : [...prev, taskId]));
+  };
+
+  const modifySelectedTasksWithAI = async () => {
+    if (!userId) return;
+    if (selectedTaskIds.length === 0) {
+      setServerMessage("Sélectionne au moins une tâche.");
+      return;
+    }
+    setPlannerLoading(true);
+    try {
+      const res = await fetch(`${API}/tasks/modify-selected`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_id: userId,
+          goal,
+          selected_task_ids: selectedTaskIds,
+          instructions: batchEditInput,
+          current_tasks: tasks,
+          conversation: plannerMessages,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Erreur de modification");
+      const nextTasks = Array.isArray(data.tasks) ? (data.tasks as Task[]) : [];
+      if (nextTasks.length > 0) {
+        setTasks(nextTasks);
+        await savePlanToServer(goal, nextTasks);
+      }
+      const summary = data.summary || "Tâches sélectionnées mises à jour.";
+      if (data.status === "needs_clarification") {
+        const questions = Array.isArray(data.questions) ? data.questions : [];
+        const text = questions.length ? `${summary}\n${questions.map((q: string, i: number) => `${i + 1}. ${q}`).join("\n")}` : summary;
+        setPlannerMessages((prev) => [...prev, { role: "assistant", content: text }]);
+        setServerMessage("L'IA demande des précisions avant d'aller plus loin.");
+      } else {
+        setPlannerMessages((prev) => [...prev, { role: "assistant", content: summary }]);
+        setServerMessage("Tâches sélectionnées modifiées.");
+        setSelectedTaskIds([]);
+      }
+    } catch (err) {
+      setServerMessage(err instanceof Error ? err.message : "Erreur de modification IA");
+    } finally {
+      setPlannerLoading(false);
+    }
   };
 
   const submitScore = async () => {
@@ -330,6 +415,21 @@ export default function Home() {
               </div>
             </div>
 
+            <div style={{ marginTop: 14, border: "1px solid #2d3f66", borderRadius: 12, padding: 10, background: "#111a30", display: "grid", gap: 8 }}>
+              <div style={{ fontSize: 13, color: "#aac1f4" }}>
+                Modification ciblée: {selectedTaskIds.length} tâche(s) sélectionnée(s)
+              </div>
+              <textarea
+                value={batchEditInput}
+                onChange={(e) => setBatchEditInput(e.target.value)}
+                placeholder="Ex: raccourcis les tâches sélectionnées à 10 minutes et rends les micro-étapes plus concrètes."
+                style={{ ...inputStyle, minHeight: 90, resize: "vertical" }}
+              />
+              <button onClick={modifySelectedTasksWithAI} style={{ ...primaryButton, width: "fit-content" }} disabled={plannerLoading}>
+                {plannerLoading ? "Modification..." : "Modifier uniquement les tâches sélectionnées"}
+              </button>
+            </div>
+
             <div style={{ margin: "12px 0", color: "#9ab3eb" }}>Progression: {progress}%</div>
             <div style={{ display: "grid", gap: 8 }}>
               {tasks.map((task) => (
@@ -352,6 +452,20 @@ export default function Home() {
                     {done.includes(task.id) ? "✅" : "⬜"} {task.title} - {task.duration} min
                   </button>
                   <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
+                    <button
+                      onClick={() => toggleTaskSelection(task.id)}
+                      style={{
+                        background: selectedTaskIds.includes(task.id) ? "#2f4f7f" : "#1d2a47",
+                        border: "1px solid #3e568f",
+                        color: "#dce7ff",
+                        borderRadius: 8,
+                        padding: "0.3rem 0.55rem",
+                        cursor: "pointer",
+                        fontSize: 12,
+                      }}
+                    >
+                      {selectedTaskIds.includes(task.id) ? "Sélectionnée" : "Sélectionner pour modification IA"}
+                    </button>
                     <button
                       onClick={() => startEditingTask(task)}
                       style={{ background: "#253252", border: "1px solid #3e568f", color: "#dce7ff", borderRadius: 8, padding: "0.3rem 0.55rem", cursor: "pointer", fontSize: 12 }}

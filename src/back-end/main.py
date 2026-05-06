@@ -70,6 +70,17 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_plans (
+                user_id TEXT PRIMARY KEY,
+                goal TEXT NOT NULL,
+                tasks_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            )
+            """
+        )
         conn.commit()
 
 
@@ -214,6 +225,7 @@ class ChatResponse(BaseModel):
 
 class PlanAssistantRequest(BaseModel):
     tasks_text: str
+    user_id: Optional[str] = None
     conversation: Optional[List[dict]] = None
 
 
@@ -222,6 +234,34 @@ class PlanAssistantResponse(BaseModel):
     summary: str
     questions: Optional[List[str]] = None
     tasks: Optional[List[Task]] = None
+
+
+class SavePlanRequest(BaseModel):
+    goal: str
+    tasks: List[Task]
+
+
+class SavedPlanResponse(BaseModel):
+    user_id: str
+    goal: str
+    tasks: List[Task]
+    updated_at: str
+
+
+class SelectedTaskEditRequest(BaseModel):
+    user_id: str
+    goal: str
+    selected_task_ids: List[int]
+    instructions: str
+    current_tasks: Optional[List[Task]] = None
+    conversation: Optional[List[dict]] = None
+
+
+class SelectedTaskEditResponse(BaseModel):
+    status: str
+    summary: str
+    questions: Optional[List[str]] = None
+    tasks: List[Task]
 
 
 # ------------------------
@@ -568,6 +608,98 @@ def ai_json_request(system_prompt: str, user_prompt: str) -> Optional[dict]:
     return None
 
 
+def merge_selected_task_updates(base_tasks: List[dict], selected_task_ids: List[int], updates: List[dict]) -> List[dict]:
+    selected = set(selected_task_ids)
+    update_by_id = {int(u["id"]): u for u in updates if isinstance(u, dict) and str(u.get("id", "")).isdigit()}
+    merged: List[dict] = []
+    for task in base_tasks:
+        task_id = int(task.get("id", 0))
+        if task_id in selected and task_id in update_by_id:
+            src = update_by_id[task_id]
+            title = str(src.get("title") or task.get("title") or "").strip() or str(task.get("title") or "")
+            duration = int(src.get("duration") or task.get("duration") or 15)
+            explanation = str(src.get("explanation") or task.get("explanation") or "").strip()
+            raw_micro = src.get("microtasks")
+            microtasks = [str(m).strip() for m in raw_micro] if isinstance(raw_micro, list) else (task.get("microtasks") or [])
+            microtasks = [m for m in microtasks if m]
+            merged.append(
+                {
+                    "id": task_id,
+                    "title": title,
+                    "duration": max(5, min(duration, 120)),
+                    "explanation": explanation,
+                    "microtasks": microtasks[:5] if microtasks else default_microtasks_for(title),
+                    "depends_on": src.get("depends_on") if isinstance(src.get("depends_on"), list) else (task.get("depends_on") or []),
+                }
+            )
+        else:
+            merged.append(task)
+    return merged
+
+
+def modify_selected_tasks_with_ai(
+    goal: str,
+    tasks: List[dict],
+    selected_task_ids: List[int],
+    instructions: str,
+    conversation: Optional[List[dict]] = None,
+) -> dict:
+    selected_tasks = [t for t in tasks if int(t.get("id", 0)) in set(selected_task_ids)]
+    if not selected_tasks:
+        return {
+            "status": "needs_clarification",
+            "summary": "Aucune tâche sélectionnée.",
+            "questions": ["Sélectionne au moins une tâche à modifier."],
+            "tasks": tasks,
+        }
+    if not instructions.strip():
+        return {
+            "status": "needs_clarification",
+            "summary": "Il manque la consigne de modification.",
+            "questions": ["Que veux-tu changer exactement sur les tâches sélectionnées ?"],
+            "tasks": tasks,
+        }
+
+    convo = conversation or []
+    convo_txt = "\n".join([f"- {m.get('role','user')}: {m.get('content','')}" for m in convo[-8:]])
+    system_prompt = (
+        "Tu modifies UNIQUEMENT les tâches sélectionnées. "
+        "Ne crée aucune donnée non fournie. Si une information manque, demande des précisions. "
+        "Réponds STRICTEMENT en JSON objet avec: "
+        "needs_clarification (bool), summary (string), questions (liste), updated_selected_tasks (liste). "
+        "updated_selected_tasks contient des objets avec id, title, duration, explanation, microtasks (3-5), depends_on. "
+        "IMPORTANT: ne modifie jamais les id."
+    )
+    user_prompt = (
+        f"Objectif:\n{goal}\n\n"
+        f"Tâches sélectionnées:\n{json.dumps(selected_tasks, ensure_ascii=False)}\n\n"
+        f"Consigne utilisateur:\n{instructions}\n\n"
+        f"Contexte conversation:\n{convo_txt or '- aucun'}\n\n"
+        "Si une donnée essentielle est absente, needs_clarification=true et pose 1 à 3 questions précises."
+    )
+    ai = ai_json_request(system_prompt, user_prompt)
+    if not ai:
+        return {
+            "status": "needs_clarification",
+            "summary": "IA indisponible pour cette modification.",
+            "questions": ["Peux-tu préciser le résultat attendu pour les tâches sélectionnées ?"],
+            "tasks": tasks,
+        }
+
+    needs = bool(ai.get("needs_clarification"))
+    questions = ai.get("questions") if isinstance(ai.get("questions"), list) else []
+    cleaned_questions = [str(q).strip() for q in questions if str(q).strip()][:3]
+    updates = ai.get("updated_selected_tasks") if isinstance(ai.get("updated_selected_tasks"), list) else []
+    merged_tasks = merge_selected_task_updates(tasks, selected_task_ids, updates)
+    merged_tasks = sort_tasks_by_dependencies(merged_tasks)
+    return {
+        "status": "needs_clarification" if needs else "ready",
+        "summary": str(ai.get("summary") or "Tâches sélectionnées modifiées."),
+        "questions": cleaned_questions,
+        "tasks": merged_tasks,
+    }
+
+
 def heuristic_plan_assistant(tasks_text: str):
     items = extract_input_items(tasks_text)
     if len(items) > 4:
@@ -759,6 +891,21 @@ def plan_assistant(data: PlanAssistantRequest):
     generated = apply_ai_dependencies(generated, analysis.get("dependencies") or [])
     generated = enrich_dependencies(generated)
     generated = sort_tasks_by_dependencies(generated)
+    if data.user_id:
+        now = datetime.now().isoformat()
+        with get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO task_plans (user_id, goal, tasks_json, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    goal = excluded.goal,
+                    tasks_json = excluded.tasks_json,
+                    updated_at = excluded.updated_at
+                """,
+                (data.user_id, tasks_text, json.dumps(generated, ensure_ascii=False), now),
+            )
+            conn.commit()
 
     # Flux principal: toujours livrer un plan. Questions seulement pour affiner.
     if analysis.get("needs_clarification"):
@@ -868,9 +1015,79 @@ def chat_with_coach(data: ChatRequest):
     return {"reply": "Tu peux commencer tout de suite par 5 minutes sur la tache la plus simple. Je te guide ensuite."}
 
 
+@app.get("/users/{user_id}/plan", response_model=SavedPlanResponse, tags=["Tasks"])
+def get_saved_plan(user_id: str):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT user_id, goal, tasks_json, updated_at FROM task_plans WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Aucun plan sauvegardé")
+    tasks = json.loads(row["tasks_json"]) if row["tasks_json"] else []
+    return {"user_id": row["user_id"], "goal": row["goal"], "tasks": tasks, "updated_at": row["updated_at"]}
+
+
+@app.post("/users/{user_id}/plan", response_model=SavedPlanResponse, tags=["Tasks"])
+def save_plan(user_id: str, data: SavePlanRequest):
+    now = datetime.now().isoformat()
+    with get_conn() as conn:
+        user = conn.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="Utilisateur introuvable")
+        conn.execute(
+            """
+            INSERT INTO task_plans (user_id, goal, tasks_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                goal = excluded.goal,
+                tasks_json = excluded.tasks_json,
+                updated_at = excluded.updated_at
+            """,
+            (user_id, data.goal.strip(), json.dumps([t.model_dump() for t in data.tasks], ensure_ascii=False), now),
+        )
+        conn.commit()
+    return {"user_id": user_id, "goal": data.goal.strip(), "tasks": data.tasks, "updated_at": now}
+
+
+@app.post("/tasks/modify-selected", response_model=SelectedTaskEditResponse, tags=["Tasks"])
+def modify_selected_tasks(data: SelectedTaskEditRequest):
+    selected = sorted({int(task_id) for task_id in data.selected_task_ids if isinstance(task_id, int) or str(task_id).isdigit()})
+    if not selected:
+        raise HTTPException(status_code=400, detail="Aucune tâche sélectionnée")
+    tasks: List[dict] = []
+    if data.current_tasks:
+        tasks = [t.model_dump() for t in data.current_tasks]
+    if not tasks:
+        with get_conn() as conn:
+            row = conn.execute("SELECT tasks_json FROM task_plans WHERE user_id = ?", (data.user_id,)).fetchone()
+        if row and row["tasks_json"]:
+            tasks = json.loads(row["tasks_json"])
+    if not tasks:
+        raise HTTPException(status_code=400, detail="Aucune tâche à modifier")
+
+    result = modify_selected_tasks_with_ai(data.goal, tasks, selected, data.instructions, data.conversation)
+    now = datetime.now().isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO task_plans (user_id, goal, tasks_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                goal = excluded.goal,
+                tasks_json = excluded.tasks_json,
+                updated_at = excluded.updated_at
+            """,
+            (data.user_id, data.goal.strip(), json.dumps(result["tasks"], ensure_ascii=False), now),
+        )
+        conn.commit()
+    return result
+
+
 @app.post("/admin/reset-site", tags=["Admin"])
 def reset_site():
     with get_conn() as conn:
         conn.execute("DELETE FROM users")
+        conn.execute("DELETE FROM task_plans")
         conn.commit()
     return {"message": "Toutes les donnees ont ete reinitialisees"}
