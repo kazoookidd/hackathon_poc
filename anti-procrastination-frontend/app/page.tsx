@@ -7,6 +7,9 @@ type DashboardTab = "chat" | "tasks" | "analytics";
 type Task = { id: number; title: string; duration: number; explanation?: string; microtasks?: string[]; depends_on?: string[] };
 type Message = { role: "user" | "coach"; content: string };
 type PlannerMessage = { role: "user" | "assistant"; content: string };
+type AttackPlan = { objective: string; steps: string[] };
+type CalendarEvent = { task_id: number; title: string; when: string };
+type Reminder = { when: string; message: string };
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const initialForm = { email: "", password: "", first_name: "", last_name: "", age: 18, profession: "", goal: "" };
@@ -27,6 +30,9 @@ export default function Home() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [selectedTaskIds, setSelectedTaskIds] = useState<number[]>([]);
   const [batchEditInput, setBatchEditInput] = useState("");
+  const [attackPlan, setAttackPlan] = useState<AttackPlan | null>(null);
+  const [calendarEvents, setCalendarEvents] = useState<CalendarEvent[]>([]);
+  const [reminders, setReminders] = useState<Reminder[]>([]);
   const [editingTaskId, setEditingTaskId] = useState<number | null>(null);
   const [taskDraft, setTaskDraft] = useState<{ title: string; duration: number; explanation: string; microtasksText: string }>({
     title: "",
@@ -66,6 +72,9 @@ export default function Home() {
       if (Array.isArray(parsed.doneMicro)) setDoneMicro(parsed.doneMicro);
       if (Array.isArray(parsed.messages)) setMessages(parsed.messages);
       if (Array.isArray(parsed.plannerMessages)) setPlannerMessages(parsed.plannerMessages);
+      if (parsed.attackPlan) setAttackPlan(parsed.attackPlan);
+      if (Array.isArray(parsed.calendarEvents)) setCalendarEvents(parsed.calendarEvents);
+      if (Array.isArray(parsed.reminders)) setReminders(parsed.reminders);
     } catch {
       // ignore corrupted cache
     }
@@ -73,9 +82,9 @@ export default function Home() {
 
   useEffect(() => {
     if (!cacheKey) return;
-    const payload = { goal, tasks, done, doneMicro, messages, plannerMessages };
+    const payload = { goal, tasks, done, doneMicro, messages, plannerMessages, attackPlan, calendarEvents, reminders };
     localStorage.setItem(cacheKey, JSON.stringify(payload));
-  }, [cacheKey, goal, tasks, done, doneMicro, messages, plannerMessages]);
+  }, [cacheKey, goal, tasks, done, doneMicro, messages, plannerMessages, attackPlan, calendarEvents, reminders]);
 
   useEffect(() => {
     if (!userId) return;
@@ -86,6 +95,9 @@ export default function Home() {
         const data = await res.json();
         if (typeof data.goal === "string") setGoal(data.goal);
         if (Array.isArray(data.tasks)) setTasks(data.tasks);
+        setAttackPlan(null);
+        setCalendarEvents([]);
+        setReminders([]);
       } catch {
         // ignore when there is no saved plan yet
       }
@@ -252,6 +264,7 @@ export default function Home() {
           goal,
           selected_task_ids: selectedTaskIds,
           instructions: batchEditInput,
+          done_task_ids: done,
           current_tasks: tasks,
           conversation: plannerMessages,
         }),
@@ -263,6 +276,9 @@ export default function Home() {
         setTasks(nextTasks);
         await savePlanToServer(goal, nextTasks);
       }
+      setAttackPlan(data.attack_plan && typeof data.attack_plan === "object" ? (data.attack_plan as AttackPlan) : null);
+      setCalendarEvents(Array.isArray(data.calendar) ? (data.calendar as CalendarEvent[]) : []);
+      setReminders(Array.isArray(data.reminders) ? (data.reminders as Reminder[]) : []);
       const summary = data.summary || "Tâches sélectionnées mises à jour.";
       if (data.status === "needs_clarification") {
         const questions = Array.isArray(data.questions) ? data.questions : [];
@@ -299,6 +315,9 @@ export default function Home() {
     setDone([]);
     setDoneMicro([]);
     setPlannerMessages([]);
+    setAttackPlan(null);
+    setCalendarEvents([]);
+    setReminders([]);
     if (cacheKey) localStorage.removeItem(cacheKey);
   };
 
@@ -429,6 +448,48 @@ export default function Home() {
                 {plannerLoading ? "Modification..." : "Modifier uniquement les tâches sélectionnées"}
               </button>
             </div>
+
+            {(attackPlan || calendarEvents.length > 0 || reminders.length > 0) && (
+              <div style={{ marginTop: 14, border: "1px solid #2d3f66", borderRadius: 12, padding: 10, background: "#111a30", display: "grid", gap: 10 }}>
+                {attackPlan && (
+                  <div>
+                    <div style={{ fontSize: 13, color: "#aac1f4", marginBottom: 4 }}>Plan d&apos;attaque</div>
+                    <div style={{ color: "#ffffff", fontWeight: 600, marginBottom: 4 }}>{attackPlan.objective}</div>
+                    <div style={{ display: "grid", gap: 4 }}>
+                      {attackPlan.steps.map((step, idx) => (
+                        <div key={`attack-${idx}`} style={{ fontSize: 13, color: "#c8d9ff" }}>
+                          {idx + 1}. {step}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {calendarEvents.length > 0 && (
+                  <div>
+                    <div style={{ fontSize: 13, color: "#aac1f4", marginBottom: 4 }}>Calendrier suggéré</div>
+                    <div style={{ display: "grid", gap: 4 }}>
+                      {calendarEvents.map((event, idx) => (
+                        <div key={`calendar-${idx}`} style={{ fontSize: 13, color: "#ffe3a8" }}>
+                          {event.when} - {event.title}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {reminders.length > 0 && (
+                  <div>
+                    <div style={{ fontSize: 13, color: "#aac1f4", marginBottom: 4 }}>Rappels</div>
+                    <div style={{ display: "grid", gap: 4 }}>
+                      {reminders.map((item, idx) => (
+                        <div key={`reminder-${idx}`} style={{ fontSize: 13, color: "#b5ffd8" }}>
+                          {item.when} - {item.message}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
 
             <div style={{ margin: "12px 0", color: "#9ab3eb" }}>Progression: {progress}%</div>
             <div style={{ display: "grid", gap: 8 }}>

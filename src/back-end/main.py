@@ -253,8 +253,25 @@ class SelectedTaskEditRequest(BaseModel):
     goal: str
     selected_task_ids: List[int]
     instructions: str
+    done_task_ids: Optional[List[int]] = None
     current_tasks: Optional[List[Task]] = None
     conversation: Optional[List[dict]] = None
+
+
+class AttackPlan(BaseModel):
+    objective: str
+    steps: List[str]
+
+
+class CalendarEvent(BaseModel):
+    task_id: int
+    title: str
+    when: str
+
+
+class Reminder(BaseModel):
+    when: str
+    message: str
 
 
 class SelectedTaskEditResponse(BaseModel):
@@ -262,6 +279,9 @@ class SelectedTaskEditResponse(BaseModel):
     summary: str
     questions: Optional[List[str]] = None
     tasks: List[Task]
+    attack_plan: Optional[AttackPlan] = None
+    calendar: Optional[List[CalendarEvent]] = None
+    reminders: Optional[List[Reminder]] = None
 
 
 # ------------------------
@@ -369,6 +389,26 @@ def parse_tasks_from_text(text: str):
         return parsed if isinstance(parsed, list) else []
     except Exception:
         return []
+
+
+def parse_json_object_from_text(text: str) -> Optional[dict]:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    match = re.search(r"\{[\s\S]*\}", raw)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
 
 
 def get_installed_ollama_models():
@@ -577,7 +617,7 @@ def ai_json_request(system_prompt: str, user_prompt: str) -> Optional[dict]:
                 response_format={"type": "json_object"},
             )
             content = response.choices[0].message.content or "{}"
-            return json.loads(content)
+            return parse_json_object_from_text(content)
         except Exception:
             pass
 
@@ -602,7 +642,9 @@ def ai_json_request(system_prompt: str, user_prompt: str) -> Optional[dict]:
                         continue
                     response.raise_for_status()
                 content = ((response.json().get("message", {}) or {}).get("content") or "{}").strip()
-                return json.loads(content)
+                parsed = parse_json_object_from_text(content)
+                if parsed:
+                    return parsed
             except Exception:
                 continue
     return None
@@ -642,9 +684,12 @@ def modify_selected_tasks_with_ai(
     tasks: List[dict],
     selected_task_ids: List[int],
     instructions: str,
+    done_task_ids: Optional[List[int]] = None,
     conversation: Optional[List[dict]] = None,
 ) -> dict:
     selected_tasks = [t for t in tasks if int(t.get("id", 0)) in set(selected_task_ids)]
+    done_set = set(done_task_ids or [])
+    selected_done_tasks = [t for t in selected_tasks if int(t.get("id", 0)) in done_set]
     if not selected_tasks:
         return {
             "status": "needs_clarification",
@@ -666,13 +711,19 @@ def modify_selected_tasks_with_ai(
         "Tu modifies UNIQUEMENT les tâches sélectionnées. "
         "Ne crée aucune donnée non fournie. Si une information manque, demande des précisions. "
         "Réponds STRICTEMENT en JSON objet avec: "
-        "needs_clarification (bool), summary (string), questions (liste), updated_selected_tasks (liste). "
+        "needs_clarification (bool), summary (string), questions (liste), updated_selected_tasks (liste), "
+        "attack_plan (objet), calendar (liste), reminders (liste). "
         "updated_selected_tasks contient des objets avec id, title, duration, explanation, microtasks (3-5), depends_on. "
+        "attack_plan contient objective (string) et steps (liste de 3 a 6 actions). "
+        "calendar contient des objets {task_id, title, when}. "
+        "reminders contient des objets {when, message}. "
+        "Le format doit être propre, clair et actionnable. "
         "IMPORTANT: ne modifie jamais les id."
     )
     user_prompt = (
         f"Objectif:\n{goal}\n\n"
         f"Tâches sélectionnées:\n{json.dumps(selected_tasks, ensure_ascii=False)}\n\n"
+        f"Tâches déjà terminées parmi la sélection:\n{json.dumps(selected_done_tasks, ensure_ascii=False)}\n\n"
         f"Consigne utilisateur:\n{instructions}\n\n"
         f"Contexte conversation:\n{convo_txt or '- aucun'}\n\n"
         "Si une donnée essentielle est absente, needs_clarification=true et pose 1 à 3 questions précises."
@@ -691,12 +742,50 @@ def modify_selected_tasks_with_ai(
     cleaned_questions = [str(q).strip() for q in questions if str(q).strip()][:3]
     updates = ai.get("updated_selected_tasks") if isinstance(ai.get("updated_selected_tasks"), list) else []
     merged_tasks = merge_selected_task_updates(tasks, selected_task_ids, updates)
-    merged_tasks = sort_tasks_by_dependencies(merged_tasks)
+    attack_src = ai.get("attack_plan") if isinstance(ai.get("attack_plan"), dict) else {}
+    attack_plan = {
+        "objective": str(attack_src.get("objective") or "Plan d'attaque ciblé").strip(),
+        "steps": [str(step).strip() for step in (attack_src.get("steps") or []) if str(step).strip()][:6],
+    }
+    if not attack_plan["steps"]:
+        attack_plan["steps"] = [
+            "Clarifier le résultat exact attendu.",
+            "Lancer un premier bloc court et concret.",
+            "Vérifier le résultat et ajuster la suite.",
+        ]
+
+    calendar_src = ai.get("calendar") if isinstance(ai.get("calendar"), list) else []
+    calendar: List[dict] = []
+    for item in calendar_src:
+        if not isinstance(item, dict):
+            continue
+        task_id = item.get("task_id")
+        if not isinstance(task_id, int):
+            continue
+        title = str(item.get("title") or "").strip()
+        when = str(item.get("when") or "").strip()
+        if title and when:
+            calendar.append({"task_id": task_id, "title": title, "when": when})
+    calendar = calendar[:8]
+
+    reminders_src = ai.get("reminders") if isinstance(ai.get("reminders"), list) else []
+    reminders: List[dict] = []
+    for item in reminders_src:
+        if not isinstance(item, dict):
+            continue
+        when = str(item.get("when") or "").strip()
+        message = str(item.get("message") or "").strip()
+        if when and message:
+            reminders.append({"when": when, "message": message})
+    reminders = reminders[:8]
     return {
         "status": "needs_clarification" if needs else "ready",
         "summary": str(ai.get("summary") or "Tâches sélectionnées modifiées."),
         "questions": cleaned_questions,
         "tasks": merged_tasks,
+        "attack_plan": attack_plan,
+        "calendar": calendar,
+        "reminders": reminders,
     }
 
 
@@ -1066,7 +1155,14 @@ def modify_selected_tasks(data: SelectedTaskEditRequest):
     if not tasks:
         raise HTTPException(status_code=400, detail="Aucune tâche à modifier")
 
-    result = modify_selected_tasks_with_ai(data.goal, tasks, selected, data.instructions, data.conversation)
+    result = modify_selected_tasks_with_ai(
+        data.goal,
+        tasks,
+        selected,
+        data.instructions,
+        data.done_task_ids,
+        data.conversation,
+    )
     now = datetime.now().isoformat()
     with get_conn() as conn:
         conn.execute(
