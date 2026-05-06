@@ -843,26 +843,39 @@ DEFAULT_DISTRACTION_KEYWORDS = [
 ]
 
 
-def list_running_process_lines() -> List[str]:
+def list_running_process_names() -> List[str]:
     try:
-        result = subprocess.run(["ps", "-eo", "comm,args"], capture_output=True, text=True, timeout=5)
+        # On ne lit que le nom executable pour eviter les faux positifs
+        # lies aux arguments de commande (URLs, chemins, etc.).
+        result = subprocess.run(["ps", "-eo", "comm="], capture_output=True, text=True, timeout=5)
         if result.returncode != 0:
             return []
-        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        return lines[1:] if len(lines) > 1 else []
+        names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        cleaned: List[str] = []
+        for name in names:
+            base = os.path.basename(name).lower().strip()
+            if base:
+                cleaned.append(base)
+        return cleaned
     except Exception:
         return []
 
 
 def detect_distraction_processes(custom_keywords: Optional[List[str]] = None) -> List[str]:
-    keywords = [k.lower().strip() for k in (custom_keywords or DEFAULT_DISTRACTION_KEYWORDS) if str(k).strip()]
-    processes = list_running_process_lines()
+    raw_keywords = custom_keywords if isinstance(custom_keywords, list) and custom_keywords else DEFAULT_DISTRACTION_KEYWORDS
+    keywords = [str(k).lower().strip() for k in raw_keywords if str(k).strip()]
+    executables = list_running_process_names()
     detected: List[str] = []
-    for proc in processes:
-        low = proc.lower()
-        if any(keyword in low for keyword in keywords):
-            detected.append(proc)
-    return detected[:20]
+    for exe in executables:
+        normalized_exe = exe.replace(".exe", "")
+        for keyword in keywords:
+            normalized_kw = keyword.replace(".exe", "").replace(".com", "")
+            if not normalized_kw:
+                continue
+            if normalized_kw == normalized_exe or normalized_kw in normalized_exe:
+                detected.append(exe)
+                break
+    return list(dict.fromkeys(detected))[:20]
 
 
 def generate_tasks(goal: str):
