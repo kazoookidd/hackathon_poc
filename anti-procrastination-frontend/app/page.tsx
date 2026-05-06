@@ -60,6 +60,9 @@ export default function Home() {
   const [focusXp, setFocusXp] = useState(0);
   const [focusStreak, setFocusStreak] = useState(0);
   const [focusFunMessage, setFocusFunMessage] = useState("Active le Focus Shield pour détecter les apps distrayantes.");
+  const [focusLockActive, setFocusLockActive] = useState(false);
+  const [focusLockUntil, setFocusLockUntil] = useState<number | null>(null);
+  const [lockNow, setLockNow] = useState(Date.now());
   const totalMicro = useMemo(() => tasks.reduce((sum, t) => sum + (t.microtasks?.length || 0), 0), [tasks]);
   const totalUnits = useMemo(() => tasks.length + totalMicro, [tasks.length, totalMicro]);
   const completedUnits = useMemo(() => done.length + doneMicro.length, [done.length, doneMicro.length]);
@@ -98,6 +101,8 @@ export default function Home() {
       if (typeof parsed.focusXp === "number") setFocusXp(parsed.focusXp);
       if (typeof parsed.focusStreak === "number") setFocusStreak(parsed.focusStreak);
       if (typeof parsed.focusFunMessage === "string") setFocusFunMessage(parsed.focusFunMessage);
+      if (typeof parsed.focusLockActive === "boolean") setFocusLockActive(parsed.focusLockActive);
+      if (typeof parsed.focusLockUntil === "number") setFocusLockUntil(parsed.focusLockUntil);
     } catch {
       // ignore corrupted cache
     }
@@ -123,6 +128,8 @@ export default function Home() {
       focusXp,
       focusStreak,
       focusFunMessage,
+      focusLockActive,
+      focusLockUntil,
     };
     localStorage.setItem(cacheKey, JSON.stringify(payload));
   }, [
@@ -144,6 +151,8 @@ export default function Home() {
     focusXp,
     focusStreak,
     focusFunMessage,
+    focusLockActive,
+    focusLockUntil,
   ]);
 
   useEffect(() => {
@@ -200,8 +209,8 @@ export default function Home() {
     }
   };
 
-  const checkFocusApps = async () => {
-    if (!focusShieldEnabled || !userId) return;
+  const checkFocusApps = async (): Promise<"focused" | "distraction_detected" | "idle"> => {
+    if (!focusShieldEnabled || !userId) return "idle";
     try {
       const custom = blockedKeywordsInput
         .split(/[,|\n]/)
@@ -218,8 +227,11 @@ export default function Home() {
       if (data.status === "distraction_detected") {
         setFocusStatus("distraction_detected");
         setFocusStreak(0);
+        setFocusLockActive(true);
+        setFocusLockUntil(Date.now() + 60000);
         setFocusFunMessage(`Alerte Focus: ${data.detected_apps.join(", ") || "app distractive"} détectée. Ferme-la et reprends ton objectif.`);
         if (alarmEnabled) playAlarm();
+        return "distraction_detected";
       } else {
         setFocusStatus("focused");
         setFocusStreak((prev) => prev + 1);
@@ -230,10 +242,40 @@ export default function Home() {
           "Combo focus maintenu, continue.",
         ];
         setFocusFunMessage(funLines[Math.floor(Math.random() * funLines.length)]);
+        return "focused";
       }
     } catch (err) {
       setFocusFunMessage(err instanceof Error ? err.message : "Erreur de surveillance Focus Shield.");
+      return "idle";
     }
+  };
+
+  const remainingLockSeconds = useMemo(() => {
+    if (!focusLockUntil) return 0;
+    const delta = Math.max(0, focusLockUntil - lockNow);
+    return Math.ceil(delta / 1000);
+  }, [focusLockUntil, lockNow]);
+
+  useEffect(() => {
+    if (!focusLockActive) return;
+    const timer = setInterval(() => setLockNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [focusLockActive]);
+
+  const tryUnlockFocusLock = async () => {
+    const status = await checkFocusApps();
+    const lockExpired = !focusLockUntil || Date.now() >= focusLockUntil;
+    if (lockExpired && status === "focused") {
+      setFocusLockActive(false);
+      setFocusLockUntil(null);
+      setFocusFunMessage("Déverrouillé. Retour en mode productif.");
+      return;
+    }
+    if (!lockExpired) {
+      setFocusFunMessage(`Encore ${remainingLockSeconds}s de cooldown avant déverrouillage.`);
+      return;
+    }
+    setFocusFunMessage("Toujours une distraction détectée. Ferme les apps et réessaie.");
   };
 
   useEffect(() => {
@@ -244,6 +286,13 @@ export default function Home() {
     }, 12000);
     return () => clearInterval(timer);
   }, [focusShieldEnabled, userId, blockedKeywordsInput, alarmEnabled]);
+
+  useEffect(() => {
+    if (!focusShieldEnabled) {
+      setFocusLockActive(false);
+      setFocusLockUntil(null);
+    }
+  }, [focusShieldEnabled]);
 
   const onAuth = async (e: FormEvent) => {
     e.preventDefault();
@@ -452,6 +501,8 @@ export default function Home() {
     setFocusXp(0);
     setFocusStreak(0);
     setFocusFunMessage("Active le Focus Shield pour détecter les apps distrayantes.");
+    setFocusLockActive(false);
+    setFocusLockUntil(null);
     if (cacheKey) localStorage.removeItem(cacheKey);
   };
 
@@ -495,6 +546,35 @@ export default function Home() {
 
   return (
     <main style={dashboardWrapper}>
+      {focusShieldEnabled && focusLockActive && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 9999,
+            background: "radial-gradient(circle at 50% 20%, rgba(255,90,90,0.2), rgba(8,12,24,0.96) 45%)",
+            display: "grid",
+            placeItems: "center",
+            padding: 16,
+          }}
+        >
+          <div style={{ width: "min(760px, 100%)", border: "1px solid #6a2f44", borderRadius: 16, background: "#10182d", padding: 18, color: "#f3f6ff", display: "grid", gap: 10 }}>
+            <div style={{ fontSize: 26, fontWeight: 700 }}>FOCUS LOCK ACTIVE</div>
+            <div style={{ color: "#ffb3b3" }}>Une app distractive est ouverte. Ferme-la avant de reprendre.</div>
+            <div style={{ color: "#ffd38a" }}>Cooldown sécurité: {remainingLockSeconds}s</div>
+            {!!detectedApps.length && <div style={{ color: "#ffd38a" }}>Détecté: {detectedApps.join(", ")}</div>}
+            <div style={{ color: "#a7c9ff" }}>Astuce fun: transforme les 60 prochaines secondes en “mission boss”. Respire, ferme l’app, relance une micro-action utile.</div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <button onClick={() => void tryUnlockFocusLock()} style={primaryButton}>
+                J&apos;ai fermé, revérifier
+              </button>
+              <button onClick={() => void checkFocusApps()} style={{ ...primaryButton, background: "#2b3d63" }}>
+                Scanner maintenant
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <aside style={sidebar}>
         <h2 style={{ marginTop: 0 }}>FOCA</h2>
         <p style={{ color: "#90a6dd", marginTop: 0 }}>Bonjour {userName}</p>
