@@ -1,4 +1,4 @@
-#!/home/wabi-lat/Perso/Hackaton_poc/hackathon_poc/src/back-end/procast/bin/python3.12
+#!/home/kazooo/delivery/hackathon/hackathon_poc/src/back-end/procast/bin/python3
 import sys
 from uvicorn.main import main
 if __name__ == '__main__':
