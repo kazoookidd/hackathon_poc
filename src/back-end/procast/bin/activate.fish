@@ -33,7 +33,7 @@ end
 # Unset irrelevant variables.
 deactivate nondestructive
 
-set -gx VIRTUAL_ENV /home/kazooo/delivery/hackathon/hackathon_poc/src/back-end/procast
+set -gx VIRTUAL_ENV /home/wabi-lat/Perso/Hackaton_poc/hackathon_poc/src/back-end/procast
 
 set -gx _OLD_VIRTUAL_PATH $PATH
 set -gx PATH "$VIRTUAL_ENV/"bin $PATH

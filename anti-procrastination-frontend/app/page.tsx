@@ -1,467 +1,459 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { CSSProperties, FormEvent, useEffect, useMemo, useState } from "react";
 
-// ─── Types ───────────────────────────────────────────────────────────────────
-
-type Task = {
-  id: number;
-  title: string;
-  duration: number;
-  microtasks: string[];
-};
-
-type Message = {
-  role: "user" | "coach";
-  content: string;
-};
-
-type Tab = "chat" | "tasks" | "stats";
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+type AuthMode = "login" | "register";
+type DashboardTab = "chat" | "tasks" | "analytics";
+type Task = { id: number; title: string; duration: number; explanation?: string; microtasks?: string[]; depends_on?: string[] };
+type Message = { role: "user" | "coach"; content: string };
+type PlannerMessage = { role: "user" | "assistant"; content: string };
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const ANTHROPIC_API = "https://api.anthropic.com/v1/messages";
-
-function generateMicrotasks(title: string): string[] {
-  const lc = title.toLowerCase();
-  if (lc.includes("ouvrir") || lc.includes("préparer"))
-    return ["Fermer les distractions", "Mettre musique de travail", "Préparer l'espace"];
-  if (lc.includes("lire"))
-    return ["Première lecture rapide", "Identifier les points clés", "Résumer en 3 mots"];
-  if (lc.includes("écrire") || lc.includes("rédiger"))
-    return ["Écrire juste 1 paragraphe", "Relire et corriger", "Passer au suivant"];
-  return ["Commencer par le plus simple", "Avancer 15 min sans pause", "Vérifier le résultat"];
-}
-
-const COACH_SYSTEM = `Tu es FOCA, un coach anti-procrastination bienveillant mais direct. Tu parles en français, de façon courte et motivante.
-
-Tes rôles :
-1. Décomposer les objectifs en micro-tâches TRÈS concrètes (3-5 étapes de 5-15 min chacune)
-2. Détecter les excuses et reformuler positivement
-3. Motiver avec des défis précis (ex: "commence juste 5 min")
-4. Proposer des alternatives si l'utilisateur bloque
-5. Célébrer les victoires
-
-Style : direct, chaleureux, jamais moralisateur. Pas de listes à puces. Réponses courtes (2-4 phrases max).
-Si l'utilisateur partage un objectif, propose toujours de l'ajouter dans l'onglet Tâches à la fin.`;
-
-// ─── Component ────────────────────────────────────────────────────────────────
+const initialForm = { email: "", password: "", first_name: "", last_name: "", age: 18, profession: "", goal: "" };
 
 export default function Home() {
-  const [tab, setTab] = useState<Tab>("chat");
-
-  // Chat state
-  const [messages, setMessages] = useState<Message[]>([
-    { role: "coach", content: "Bonjour ! Je suis FOCA, ton coach anti-procrastination. Quel est ton objectif du jour ?" },
-  ]);
+  const [authMode, setAuthMode] = useState<AuthMode>("register");
+  const [tab, setTab] = useState<DashboardTab>("chat");
+  const [userId, setUserId] = useState<string | null>(null);
+  const [userName, setUserName] = useState("");
+  const [form, setForm] = useState(initialForm);
+  const [authError, setAuthError] = useState("");
+  const [serverMessage, setServerMessage] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [messages, setMessages] = useState<Message[]>([{ role: "coach", content: "Je suis FOCA. Donne-moi ton objectif et je te le découpe tout de suite." }]);
   const [chatInput, setChatInput] = useState("");
   const [isTyping, setIsTyping] = useState(false);
-  const chatEndRef = useRef<HTMLDivElement>(null);
-
-  // Tasks state
   const [goal, setGoal] = useState("");
   const [tasks, setTasks] = useState<Task[]>([]);
-  const [completed, setCompleted] = useState<Set<number>>(new Set());
-  const [expandedTask, setExpandedTask] = useState<number | null>(null);
-  const [doneMicro, setDoneMicro] = useState<Set<string>>(new Set());
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [notification, setNotification] = useState("Tu avais prévu des tâches — on commence par 5 min ?");
-  const [notifType, setNotifType] = useState<"warning" | "success">("warning");
-
-  // Stats state
-  const [streak] = useState(3);
-  const [totalDone, setTotalDone] = useState(0);
-
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, isTyping]);
-
-  // ── Score calculation ──────────────────────────────────────────────────────
-
-  const progress = tasks.length === 0 ? 0 : Math.round((completed.size / tasks.length) * 100);
-  const circumference = 175.9;
-  const ringOffset = circumference - (circumference * progress) / 100;
-
-  const scoreMessage = () => {
-    if (progress === 100) return "Journée accomplie 🏆";
-    if (progress >= 75) return "Presque fini !";
-    if (progress >= 50) return "Plus de la moitié — wow !";
-    if (progress > 0) return "Tu avances, continue !";
-    return "Commence ta première tâche !";
+  const [editingTaskId, setEditingTaskId] = useState<number | null>(null);
+  const [taskDraft, setTaskDraft] = useState<{ title: string; duration: number; explanation: string; microtasksText: string }>({
+    title: "",
+    duration: 15,
+    explanation: "",
+    microtasksText: "",
+  });
+  const [done, setDone] = useState<number[]>([]);
+  const [doneMicro, setDoneMicro] = useState<string[]>([]);
+  const [plannerMessages, setPlannerMessages] = useState<PlannerMessage[]>([]);
+  const [plannerInput, setPlannerInput] = useState("");
+  const [plannerLoading, setPlannerLoading] = useState(false);
+  const totalMicro = useMemo(() => tasks.reduce((sum, t) => sum + (t.microtasks?.length || 0), 0), [tasks]);
+  const totalUnits = useMemo(() => tasks.length + totalMicro, [tasks.length, totalMicro]);
+  const completedUnits = useMemo(() => done.length + doneMicro.length, [done.length, doneMicro.length]);
+  const progress = useMemo(() => (totalUnits ? Math.round((completedUnits / totalUnits) * 100) : 0), [completedUnits, totalUnits]);
+  const isTaskBlocked = (task: Task) => {
+    const deps = task.depends_on || [];
+    if (!deps.length) return false;
+    return deps.some((depTitle) => {
+      const depTask = tasks.find((t) => t.title === depTitle);
+      return depTask ? !done.includes(depTask.id) : false;
+    });
   };
 
-  // ── Chat ──────────────────────────────────────────────────────────────────
+  const cacheKey = useMemo(() => (userId ? `foca-cache-${userId}` : null), [userId]);
 
-  const sendToCoach = async (userMsg: string) => {
-    if (!userMsg.trim()) return;
-    const newMessages: Message[] = [...messages, { role: "user", content: userMsg }];
-    setMessages(newMessages);
+  useEffect(() => {
+    if (!cacheKey) return;
+    try {
+      const raw = localStorage.getItem(cacheKey);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (parsed.goal) setGoal(parsed.goal);
+      if (Array.isArray(parsed.tasks)) setTasks(parsed.tasks);
+      if (Array.isArray(parsed.done)) setDone(parsed.done);
+      if (Array.isArray(parsed.doneMicro)) setDoneMicro(parsed.doneMicro);
+      if (Array.isArray(parsed.messages)) setMessages(parsed.messages);
+      if (Array.isArray(parsed.plannerMessages)) setPlannerMessages(parsed.plannerMessages);
+    } catch {
+      // ignore corrupted cache
+    }
+  }, [cacheKey]);
+
+  useEffect(() => {
+    if (!cacheKey) return;
+    const payload = { goal, tasks, done, doneMicro, messages, plannerMessages };
+    localStorage.setItem(cacheKey, JSON.stringify(payload));
+  }, [cacheKey, goal, tasks, done, doneMicro, messages, plannerMessages]);
+
+  const onAuth = async (e: FormEvent) => {
+    e.preventDefault();
+    setAuthError("");
+    setLoading(true);
+    try {
+      const endpoint = authMode === "register" ? "/register" : "/login";
+      const payload = authMode === "register" ? form : { email: form.email, password: form.password };
+      const res = await fetch(`${API}${endpoint}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Erreur d'authentification");
+      setUserId(data.user_id);
+      setUserName(data.first_name);
+      setGoal(form.goal);
+      setServerMessage(data.message || "Connecté.");
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : "Erreur réseau");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const sendToCoach = async () => {
+    if (!chatInput.trim()) return;
+    const next = [...messages, { role: "user" as const, content: chatInput }];
+    setMessages(next);
     setChatInput("");
     setIsTyping(true);
-
     try {
-      const res = await fetch(ANTHROPIC_API, {
+      const res = await fetch(`${API}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 1000,
-          system: COACH_SYSTEM,
-          messages: newMessages.map((m) => ({ role: m.role === "coach" ? "assistant" : "user", content: m.content })),
-        }),
+        body: JSON.stringify({ messages: next, tasks_context: tasks, current_goal: goal }),
       });
       const data = await res.json();
-      const reply = data.content?.[0]?.text || "Je suis là pour t'aider ! Dis-moi ton objectif.";
-      setMessages([...newMessages, { role: "coach", content: reply }]);
-
-      // Pre-fill goal if user mentions a task
-      const lc = userMsg.toLowerCase();
-      if (lc.includes("faire") || lc.includes("terminer") || lc.includes("finir") || lc.includes("travail")) {
-        setGoal(userMsg);
-      }
+      setMessages([...next, { role: "coach", content: data.reply || "On lance 5 minutes maintenant." }]);
     } catch {
-      setMessages([...newMessages, { role: "coach", content: "Je suis là ! Dis-moi ton objectif du jour et je te génère un plan." }]);
+      setMessages([...next, { role: "coach", content: "Erreur réseau côté IA. Vérifie le backend et Ollama." }]);
     } finally {
       setIsTyping(false);
     }
   };
 
-  const quickReplies = (msg: string) => {
-    const lc = msg.toLowerCase();
-    if (lc.includes("procrastin") || lc.includes("bloque") || lc.includes("flemme"))
-      return ["Juste 5 minutes", "Pourquoi je bloque ?", "Donne-moi un défi"];
-    if (lc.includes("faire") || lc.includes("terminer") || lc.includes("finir"))
-      return ["Générer le plan ⚡", "Découper en micro-tâches", "Comment commencer ?"];
-    return ["Je procrastine...", "Nouveau défi", "Mon score"];
-  };
-
-  const lastCoachMsg = [...messages].reverse().find((m) => m.role === "coach")?.content || "";
-
-  // ── Tasks ──────────────────────────────────────────────────────────────────
-
-  const generatePlan = async () => {
+  const analyzeTasksWithPlanner = async (extraConversation?: PlannerMessage[]) => {
     if (!goal.trim()) return;
-    setIsGenerating(true);
-    setCompleted(new Set());
-
+    setPlannerLoading(true);
     try {
-      const res = await fetch(`${API}/generate-plan`, {
+      const conversation = extraConversation || plannerMessages;
+      const res = await fetch(`${API}/plan-assistant`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ goal }),
+        body: JSON.stringify({ tasks_text: goal, conversation }),
       });
       const data = await res.json();
-      const raw: Task[] = data.tasks || [];
-      setTasks(raw.map((t, i) => ({ ...t, id: i + 1, microtasks: t.microtasks || generateMicrotasks(t.title) })));
+      const summary = data.summary || "Analyse du plan effectuée.";
+      const nextTasks = (data.tasks || []) as Task[];
+      if (nextTasks.length > 0) {
+        setTasks(nextTasks.map((t: Task, i: number) => ({ ...t, id: i + 1 })));
+        setDone([]);
+        setDoneMicro([]);
+      }
+      if (data.status === "needs_clarification") {
+        const questions = (data.questions || []) as string[];
+        const cleanQuestions = questions.filter((q) => typeof q === "string" && q.trim().length > 0);
+        setPlannerMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content: cleanQuestions.length > 0 ? `${summary}\n${cleanQuestions.map((q: string, i: number) => `${i + 1}. ${q}`).join("\n")}` : summary,
+          },
+        ]);
+        setServerMessage("Plan de base généré. Tu peux répondre aux questions pour l'affiner.");
+      } else {
+        setPlannerMessages((prev) => [...prev, { role: "assistant", content: summary }]);
+        setServerMessage("Programme généré avec dépendances.");
+      }
     } catch {
-      setTasks([
-        { id: 1, title: "Ouvrir les outils nécessaires", duration: 5, microtasks: ["Fermer les onglets inutiles", "Mettre le téléphone en silencieux", "Préparer un verre d'eau"] },
-        { id: 2, title: "Lire les consignes et noter 3 points clés", duration: 10, microtasks: ["Lire une première fois", "Surligner les mots-clés", "Écrire l'objectif en une phrase"] },
-        { id: 3, title: `Avancer sur : ${goal}`, duration: 20, microtasks: ["Commencer par la partie la plus simple", "Travailler 15 min sans distraction", "Faire un bilan rapide"] },
-      ]);
+      setPlannerMessages((prev) => [...prev, { role: "assistant", content: "Erreur pendant la planification IA. Réessaie." }]);
     } finally {
-      setIsGenerating(false);
+      setPlannerLoading(false);
     }
   };
 
-  const toggleTask = (id: number) => {
-    const next = new Set(completed);
-    if (next.has(id)) {
-      next.delete(id);
-    } else {
-      next.add(id);
-      setTotalDone((d) => d + 1);
-      const tips = ["Excellent ! Tu es en mouvement 🔥", "Parfait, continue sur ta lancée !", "Tâche terminée — pause de 5 min méritée", "Incroyable ! Plus que quelques tâches 💪"];
-      setNotification(tips[Math.min(next.size - 1, tips.length - 1)]);
-      setNotifType("success");
-    }
-    setCompleted(next);
-    setExpandedTask(id);
+  const sendPlannerMessage = async () => {
+    if (!plannerInput.trim()) return;
+    const next = [...plannerMessages, { role: "user" as const, content: plannerInput }];
+    setPlannerMessages(next);
+    setPlannerInput("");
+    await analyzeTasksWithPlanner(next);
   };
 
-  const toggleMicro = (key: string) => {
-    const next = new Set(doneMicro);
-    next.has(key) ? next.delete(key) : next.add(key);
-    setDoneMicro(next);
+  const startEditingTask = (task: Task) => {
+    setEditingTaskId(task.id);
+    setTaskDraft({
+      title: task.title,
+      duration: task.duration,
+      explanation: task.explanation || "",
+      microtasksText: (task.microtasks || []).join("\n"),
+    });
+  };
+
+  const saveTaskEdit = () => {
+    if (editingTaskId === null) return;
+    setTasks((prev) =>
+      prev.map((t) =>
+        t.id === editingTaskId
+          ? {
+              ...t,
+              title: taskDraft.title.trim() || t.title,
+              duration: Math.max(5, taskDraft.duration || 15),
+              explanation: taskDraft.explanation.trim(),
+              microtasks: taskDraft.microtasksText
+                .split("\n")
+                .map((m) => m.trim())
+                .filter(Boolean),
+            }
+          : t
+      )
+    );
+    setEditingTaskId(null);
   };
 
   const submitScore = async () => {
-    if (!tasks.length) return;
-    try {
-      const res = await fetch(`${API}/score`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ completed: completed.size, total: tasks.length }),
-      });
-      const data = await res.json();
-      setNotification(`${data.score}% — ${data.message}`);
-      setNotifType("success");
-    } catch {
-      setNotification(`${progress}% ${progress === 100 ? "— Parfait 🔥" : progress >= 70 ? "— Très bon travail 💪" : "— On fait mieux demain 💥"}`);
-      setNotifType("success");
-    }
+    const res = await fetch(`${API}/score`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ completed: completedUnits, total: totalUnits }) });
+    const data = await res.json();
+    setServerMessage(`${data.score}% - ${data.message}`);
   };
 
-  // ── Week dots ──────────────────────────────────────────────────────────────
+  const resetSite = async () => {
+    const res = await fetch(`${API}/admin/reset-site`, { method: "POST" });
+    const data = await res.json();
+    setServerMessage(data.message || "Réinitialisé.");
+    setUserId(null);
+    setUserName("");
+    setForm(initialForm);
+    setMessages([{ role: "coach", content: "Nouveau départ. Prêt ?" }]);
+    setTasks([]);
+    setDone([]);
+    setDoneMicro([]);
+    setPlannerMessages([]);
+    if (cacheKey) localStorage.removeItem(cacheKey);
+  };
 
-  const dayNames = ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"];
-  const today = new Date().getDay();
-  const weekPattern = [true, true, true, false, false, false, false];
-
-  // ─── Render ───────────────────────────────────────────────────────────────
+  if (!userId) {
+    return (
+      <main style={authWrapper}>
+        <section style={authHero}>
+          <h1 style={{ margin: 0, fontSize: 46, lineHeight: 1.08 }}>FOCA</h1>
+          <p style={{ fontSize: 18, color: "#9dc0ff", marginTop: 8 }}>Coach IA anti-procrastination</p>
+          <p style={{ color: "#c8d3ee", maxWidth: 500 }}>Une interface claire, des plans concrets, et un assistant connecté à ton backend IA.</p>
+          <div style={{ display: "flex", gap: 10 }}>
+            {["Menu dashboard", "Chat IA", "Plan de tâches"].map((pill) => (
+              <span key={pill} style={pillStyle}>{pill}</span>
+            ))}
+          </div>
+        </section>
+        <section style={authCard}>
+          <div style={{ display: "flex", marginBottom: 14, gap: 8 }}>
+            <button type="button" onClick={() => setAuthMode("register")} style={{ ...tabButton, ...(authMode === "register" ? activeTab : {}) }}>Inscription</button>
+            <button type="button" onClick={() => setAuthMode("login")} style={{ ...tabButton, ...(authMode === "login" ? activeTab : {}) }}>Connexion</button>
+          </div>
+          <form onSubmit={onAuth} style={{ display: "grid", gap: 10 }}>
+            <input required value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="Email" style={inputStyle} />
+            <input required type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder="Mot de passe" style={inputStyle} />
+            {authMode === "register" && (
+              <>
+                <input required value={form.first_name} onChange={(e) => setForm({ ...form, first_name: e.target.value })} placeholder="Prénom" style={inputStyle} />
+                <input required value={form.last_name} onChange={(e) => setForm({ ...form, last_name: e.target.value })} placeholder="Nom" style={inputStyle} />
+                <input required type="number" min={13} value={form.age} onChange={(e) => setForm({ ...form, age: Number(e.target.value) })} placeholder="Age" style={inputStyle} />
+                <input required value={form.profession} onChange={(e) => setForm({ ...form, profession: e.target.value })} placeholder="Profession" style={inputStyle} />
+                <input required value={form.goal} onChange={(e) => setForm({ ...form, goal: e.target.value })} placeholder="Objectif principal" style={inputStyle} />
+              </>
+            )}
+            {authError && <small style={{ color: "#ff9f9f" }}>{authError}</small>}
+            <button style={primaryButton} disabled={loading}>{loading ? "Chargement..." : authMode === "register" ? "Créer le compte" : "Se connecter"}</button>
+          </form>
+        </section>
+      </main>
+    );
+  }
 
   return (
-    <main style={{ fontFamily: "'DM Sans', sans-serif", background: "#0F0E0C", color: "#F5F0E8", minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center" }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Sans:wght@300;400;500&display=swap');
-        * { box-sizing: border-box; }
-        ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-thumb { background: #2E2D2A; border-radius: 2px; }
-        textarea { outline: none; }
-        .qr-btn:hover { border-color: #FF4D1C !important; color: #FF4D1C !important; }
-        .task-card:hover { border-color: rgba(255,77,28,0.3) !important; }
-        .send-btn:hover { transform: scale(1.05); }
-        .gen-btn:hover:not(:disabled) { background: #ff3800 !important; }
-      `}</style>
+    <main style={dashboardWrapper}>
+      <aside style={sidebar}>
+        <h2 style={{ marginTop: 0 }}>FOCA</h2>
+        <p style={{ color: "#90a6dd", marginTop: 0 }}>Bonjour {userName}</p>
+        {(["chat", "tasks", "analytics"] as DashboardTab[]).map((item) => (
+          <button key={item} onClick={() => setTab(item)} style={{ ...menuItem, ...(tab === item ? activeMenuItem : {}) }}>
+            {item === "chat" ? "Coach IA" : item === "tasks" ? "Tâches" : "Stats"}
+          </button>
+        ))}
+        <button onClick={resetSite} style={{ ...primaryButton, marginTop: "auto", background: "linear-gradient(90deg,#ff5f6d,#ff9966)" }}>Réinitialiser</button>
+      </aside>
 
-      <div style={{ width: "100%", maxWidth: 480, display: "flex", flexDirection: "column", minHeight: "100vh", paddingBottom: tab === "chat" ? 80 : 20 }}>
+      <section style={content}>
+        <header style={topbar}>
+          <h1 style={{ margin: 0 }}>{tab === "chat" ? "Discussion avec le coach" : tab === "tasks" ? "Plan d'action" : "Suivi"}</h1>
+          <div style={statusBadge}>{serverMessage || "Système prêt"}</div>
+        </header>
 
-        {/* HEADER */}
-        <div style={{ padding: "20px 20px 0", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-          <div style={{ fontFamily: "'Syne', sans-serif", fontWeight: 800, fontSize: 18, color: "#FF4D1C", letterSpacing: "-0.5px" }}>FOCA⚡</div>
-          <div style={{ display: "flex", alignItems: "center", gap: 6, background: "rgba(255,77,28,0.15)", border: "1px solid rgba(255,77,28,0.3)", borderRadius: 100, padding: "6px 14px", fontSize: 13, fontWeight: 500, color: "#FF4D1C" }}>
-            🔥 {streak} jours
-          </div>
-        </div>
-
-        {/* SCORE CARD */}
-        <div style={{ margin: "16px 20px", padding: 20, background: "linear-gradient(135deg, #FF4D1C 0%, #FF7A00 100%)", borderRadius: 20, position: "relative", overflow: "hidden" }}>
-          <div style={{ position: "absolute", right: -20, top: -30, width: 140, height: 140, borderRadius: "50%", background: "rgba(255,255,255,0.08)" }} />
-          <div style={{ fontSize: 12, fontWeight: 500, opacity: 0.8, textTransform: "uppercase", letterSpacing: 1 }}>Score du jour</div>
-          <div style={{ fontFamily: "'Syne', sans-serif", fontSize: 52, fontWeight: 800, lineHeight: 1, margin: "4px 0" }}>{progress}%</div>
-          <div style={{ fontSize: 14, opacity: 0.9 }}>{scoreMessage()}</div>
-          <svg style={{ position: "absolute", right: 20, top: "50%", transform: "translateY(-50%)" }} width="70" height="70" viewBox="0 0 70 70">
-            <circle cx="35" cy="35" r="28" fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="5" />
-            <circle cx="35" cy="35" r="28" fill="none" stroke="white" strokeWidth="5" strokeLinecap="round"
-              strokeDasharray={circumference} strokeDashoffset={ringOffset}
-              transform="rotate(-90 35 35)" style={{ transition: "stroke-dashoffset 0.6s ease" }} />
-          </svg>
-        </div>
-
-        {/* NOTIFICATION */}
-        <div style={{ margin: "0 20px 12px", padding: "12px 16px", background: notifType === "success" ? "rgba(76,175,125,0.1)" : "rgba(255,179,71,0.1)", border: `1px solid ${notifType === "success" ? "rgba(76,175,125,0.25)" : "rgba(255,179,71,0.25)"}`, borderRadius: 12, fontSize: 13, color: notifType === "success" ? "#4CAF7D" : "#FFB347", display: "flex", alignItems: "center", gap: 10 }}>
-          <span style={{ fontSize: 18 }}>{notifType === "success" ? "🎉" : "💬"}</span>
-          <span>{notification}</span>
-        </div>
-
-        {/* TABS */}
-        <div style={{ display: "flex", margin: "0 20px", gap: 4, background: "#1A1917", borderRadius: 12, padding: 4 }}>
-          {(["chat", "tasks", "stats"] as Tab[]).map((t) => (
-            <button key={t} onClick={() => setTab(t)} style={{ flex: 1, padding: 10, border: "none", background: tab === t ? "#242320" : "transparent", color: tab === t ? "#F5F0E8" : "#8A8680", fontFamily: "'DM Sans', sans-serif", fontSize: 13, fontWeight: 500, borderRadius: 8, cursor: "pointer", transition: "all 0.2s" }}>
-              {t === "chat" ? "Coach IA" : t === "tasks" ? "Tâches" : "Stats"}
-            </button>
-          ))}
-        </div>
-
-        {/* ── CHAT TAB ── */}
         {tab === "chat" && (
-          <div style={{ padding: "16px 20px", flex: 1, display: "flex", flexDirection: "column", gap: 12 }}>
-            {messages.map((m, i) => (
-              <div key={i} style={{ display: "flex", gap: 10, alignItems: "flex-end", flexDirection: m.role === "user" ? "row-reverse" : "row" }}>
-                <div style={{ width: 32, height: 32, borderRadius: "50%", background: m.role === "coach" ? "#2E2D2A" : "#FF4D1C", display: "flex", alignItems: "center", justifyContent: "center", fontSize: m.role === "coach" ? 16 : 14, fontWeight: 700, flexShrink: 0 }}>
-                  {m.role === "coach" ? "🤖" : "T"}
+          <div style={panelStyle}>
+            <div style={chatArea}>
+              {messages.map((m, i) => (
+                <div key={i} style={{ ...chatBubble, alignSelf: m.role === "user" ? "flex-end" : "flex-start", background: m.role === "user" ? "#4f6fff" : "#1b2540" }}>
+                  <strong>{m.role === "user" ? "Vous" : "FOCA"}</strong>
+                  <div>{m.content}</div>
                 </div>
-                <div style={{ maxWidth: "80%", padding: "12px 16px", borderRadius: 18, borderBottomLeftRadius: m.role === "coach" ? 4 : 18, borderBottomRightRadius: m.role === "user" ? 4 : 18, fontSize: 14, lineHeight: 1.5, background: m.role === "coach" ? "#1A1917" : "#FF4D1C", color: "#F5F0E8", textAlign: m.role === "user" ? "right" : "left" }}>
-                  {m.content}
-                </div>
-              </div>
-            ))}
-
-            {isTyping && (
-              <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
-                <div style={{ width: 32, height: 32, borderRadius: "50%", background: "#2E2D2A", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>🤖</div>
-                <div style={{ padding: "14px 18px", borderRadius: 18, borderBottomLeftRadius: 4, background: "#1A1917", display: "flex", gap: 4 }}>
-                  {[0, 200, 400].map((delay) => (
-                    <div key={delay} style={{ width: 7, height: 7, borderRadius: "50%", background: "#8A8680", animation: "blink 1.2s infinite", animationDelay: `${delay}ms` }} />
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Quick replies */}
-            {!isTyping && (
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, paddingLeft: 42 }}>
-                {quickReplies(lastCoachMsg).map((r) => (
-                  <button key={r} className="qr-btn" onClick={() => sendToCoach(r)} style={{ padding: "8px 14px", borderRadius: 100, border: "1px solid rgba(245,240,232,0.08)", background: "#1A1917", color: "#F5F0E8", fontSize: 12, cursor: "pointer", fontFamily: "'DM Sans', sans-serif", transition: "all 0.2s" }}>
-                    {r}
-                  </button>
-                ))}
-              </div>
-            )}
-
-            <div ref={chatEndRef} />
+              ))}
+              {isTyping && <div style={{ color: "#9ab3eb" }}>FOCA écrit...</div>}
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <input value={chatInput} onChange={(e) => setChatInput(e.target.value)} placeholder="Ex: je bloque sur mon rapport..." style={{ ...inputStyle, flex: 1 }} />
+              <button onClick={sendToCoach} style={primaryButton}>Envoyer</button>
+            </div>
           </div>
         )}
 
-        {/* ── TASKS TAB ── */}
         {tab === "tasks" && (
-          <div style={{ padding: "16px 20px" }}>
-            <div style={{ background: "#1A1917", borderRadius: 16, padding: 16, marginBottom: 16 }}>
-              <div style={{ fontSize: 12, color: "#8A8680", marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.5px" }}>Objectif du jour</div>
+          <div style={panelStyle}>
+            <div style={{ display: "grid", gap: 10 }}>
+              <label style={{ color: "#aac1f4", fontSize: 14 }}>Entre tes tâches (une ligne = une tâche)</label>
               <textarea
                 value={goal}
                 onChange={(e) => setGoal(e.target.value)}
-                placeholder="Ex: Terminer le rapport de projet, Réviser les maths..."
-                style={{ width: "100%", background: "#2E2D2A", border: "1px solid rgba(245,240,232,0.08)", borderRadius: 10, padding: 12, color: "#F5F0E8", fontFamily: "'DM Sans', sans-serif", fontSize: 14, resize: "none", minHeight: 70 }}
+                placeholder={"Ex:\nRédiger l'introduction du rapport\nFaire les slides de présentation\nRéviser le chapitre 4"}
+                style={{ ...inputStyle, minHeight: 110, resize: "vertical" }}
               />
-              <button
-                className="gen-btn"
-                onClick={generatePlan}
-                disabled={isGenerating || !goal.trim()}
-                style={{ width: "100%", marginTop: 10, padding: 13, border: "none", background: "#FF4D1C", color: "white", borderRadius: 10, fontFamily: "'Syne', sans-serif", fontWeight: 700, fontSize: 14, cursor: isGenerating ? "not-allowed" : "pointer", transition: "all 0.2s", opacity: isGenerating || !goal.trim() ? 0.5 : 1 }}
-              >
-                {isGenerating ? "Génération en cours..." : "⚡ Générer mon plan d'action"}
-              </button>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <button onClick={() => analyzeTasksWithPlanner()} style={{ ...primaryButton, width: "fit-content" }} disabled={plannerLoading}>
+                  {plannerLoading ? "Analyse..." : "Analyser avec l'IA"}
+                </button>
+              </div>
             </div>
 
-            {tasks.length > 0 && (
-              <>
-                <div style={{ background: "#1A1917", borderRadius: 14, padding: 16, marginBottom: 16 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-                    <div style={{ fontSize: 13, fontWeight: 500 }}>Progression</div>
-                    <div style={{ fontFamily: "'Syne', sans-serif", fontSize: 20, fontWeight: 800, color: "#FF4D1C" }}>{progress}%</div>
+            <div style={{ marginTop: 14, border: "1px solid #2d3f66", borderRadius: 12, padding: 10, background: "#111a30" }}>
+              <div style={{ fontSize: 13, color: "#aac1f4", marginBottom: 8 }}>Discussion de planification</div>
+              <div style={{ maxHeight: 150, overflow: "auto", display: "grid", gap: 6, marginBottom: 8 }}>
+                {plannerMessages.length === 0 && <div style={{ color: "#93a9d7", fontSize: 13 }}>L&apos;IA peut te poser des questions sur priorités, deadlines et dépendances.</div>}
+                {plannerMessages.map((m, idx) => (
+                  <div key={idx} style={{ fontSize: 13, color: m.role === "assistant" ? "#c8d9ff" : "#ffffff", whiteSpace: "pre-wrap" }}>
+                    <strong>{m.role === "assistant" ? "IA" : "Toi"}:</strong> {m.content}
                   </div>
-                  <div style={{ height: 8, background: "#2E2D2A", borderRadius: 100, overflow: "hidden" }}>
-                    <div style={{ height: "100%", background: "linear-gradient(90deg, #FF4D1C, #FFB347)", borderRadius: 100, width: `${progress}%`, transition: "width 0.4s ease" }} />
-                  </div>
-                </div>
+                ))}
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input
+                  value={plannerInput}
+                  onChange={(e) => setPlannerInput(e.target.value)}
+                  placeholder="Réponds aux questions de l'IA..."
+                  style={{ ...inputStyle, flex: 1 }}
+                />
+                <button onClick={sendPlannerMessage} style={primaryButton} disabled={plannerLoading}>Envoyer</button>
+              </div>
+            </div>
 
-                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                  {tasks.map((task) => {
-                    const done = completed.has(task.id);
-                    const expanded = expandedTask === task.id;
-                    return (
-                      <div
-                        key={task.id}
-                        className="task-card"
-                        onClick={() => toggleTask(task.id)}
-                        style={{ background: done ? "rgba(76,175,125,0.05)" : "#1A1917", borderRadius: 14, padding: 16, border: `1px solid ${done ? "rgba(76,175,125,0.3)" : "rgba(245,240,232,0.08)"}`, display: "flex", alignItems: "flex-start", gap: 14, cursor: "pointer", transition: "all 0.2s", position: "relative", overflow: "hidden" }}
-                      >
-                        {done && <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: 3, background: "#4CAF7D" }} />}
-                        <div style={{ width: 24, height: 24, borderRadius: "50%", border: `2px solid ${done ? "#4CAF7D" : "rgba(245,240,232,0.08)"}`, background: done ? "#4CAF7D" : "transparent", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", marginTop: 1, transition: "all 0.2s" }}>
-                          {done && <svg viewBox="0 0 24 24" width="14" height="14" fill="white"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" /></svg>}
-                        </div>
-                        <div style={{ flex: 1 }}>
-                          <div style={{ fontSize: 14, fontWeight: 500, lineHeight: 1.4, marginBottom: 6, textDecoration: done ? "line-through" : "none", opacity: done ? 0.6 : 1 }}>{task.title}</div>
-                          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                            <span style={{ fontSize: 11, color: "#FF4D1C", background: "rgba(255,77,28,0.12)", padding: "2px 8px", borderRadius: 100, fontFamily: "'Syne', sans-serif", fontWeight: 700 }}>Tâche {task.id}</span>
-                            <span style={{ fontSize: 11, color: "#8A8680" }}>⏱ {task.duration} min</span>
-                          </div>
-                          {(done || expanded) && (
-                            <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 6 }} onClick={(e) => e.stopPropagation()}>
-                              {task.microtasks.map((m, idx) => {
-                                const key = `${task.id}-${idx}`;
-                                const mdone = doneMicro.has(key);
-                                return (
-                                  <div key={key} onClick={() => toggleMicro(key)} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", background: "#2E2D2A", borderRadius: 8, fontSize: 12, color: mdone ? "#8A8680" : "#8A8680", cursor: "pointer", textDecoration: mdone ? "line-through" : "none" }}>
-                                    <div style={{ width: 6, height: 6, borderRadius: "50%", background: mdone ? "#4CAF7D" : "rgba(245,240,232,0.15)", flexShrink: 0 }} />
-                                    <span>{m}</span>
-                                  </div>
-                                );
-                              })}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-
-                <button
-                  onClick={submitScore}
-                  style={{ width: "100%", padding: 14, border: "none", borderRadius: 12, marginTop: 16, background: completed.size > 0 ? "#4CAF7D" : "#2E2D2A", color: completed.size > 0 ? "white" : "#8A8680", fontFamily: "'Syne', sans-serif", fontWeight: 700, fontSize: 14, cursor: "pointer", transition: "all 0.2s" }}
+            <div style={{ margin: "12px 0", color: "#9ab3eb" }}>Progression: {progress}%</div>
+            <div style={{ display: "grid", gap: 8 }}>
+              {tasks.map((task) => (
+                <div
+                  key={task.id}
+                  style={{
+                    ...taskItem,
+                    background: done.includes(task.id) ? "#1f6d49" : isTaskBlocked(task) ? "#2c2432" : "#17203a",
+                    borderColor: isTaskBlocked(task) ? "#7d5a90" : "#33456f",
+                    opacity: isTaskBlocked(task) && !done.includes(task.id) ? 0.75 : 1,
+                  }}
                 >
-                  Voir mon score final 🏆
-                </button>
-              </>
-            )}
-          </div>
-        )}
-
-        {/* ── STATS TAB ── */}
-        {tab === "stats" && (
-          <div style={{ padding: "16px 20px" }}>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-              {[
-                { icon: "🔥", val: streak, label: "Streak actuel", color: "#FF4D1C" },
-                { icon: "⚡", val: `${progress}%`, label: "Score du jour", color: "#FF4D1C" },
-                { icon: "✅", val: totalDone, label: "Tâches faites", color: "#F5F0E8" },
-                { icon: "⏱", val: `${tasks.reduce((s, t) => s + t.duration, 0)}m`, label: "Temps prévu", color: "#F5F0E8" },
-              ].map(({ icon, val, label, color }) => (
-                <div key={label} style={{ background: "#1A1917", borderRadius: 14, padding: 16, border: "1px solid rgba(245,240,232,0.08)" }}>
-                  <div style={{ fontSize: 22, marginBottom: 8 }}>{icon}</div>
-                  <div style={{ fontFamily: "'Syne', sans-serif", fontSize: 28, fontWeight: 800, color }}>{val}</div>
-                  <div style={{ fontSize: 11, color: "#8A8680", marginTop: 2, textTransform: "uppercase", letterSpacing: "0.5px" }}>{label}</div>
+                  <button
+                    onClick={() => {
+                      if (isTaskBlocked(task) && !done.includes(task.id)) return;
+                      setDone((d) => (d.includes(task.id) ? d.filter((x) => x !== task.id) : [...d, task.id]));
+                    }}
+                    style={{ background: "transparent", border: "none", color: "white", width: "100%", textAlign: "left", cursor: "pointer", padding: 0, fontSize: 15, fontWeight: 600 }}
+                  >
+                    {done.includes(task.id) ? "✅" : "⬜"} {task.title} - {task.duration} min
+                  </button>
+                  <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
+                    <button
+                      onClick={() => startEditingTask(task)}
+                      style={{ background: "#253252", border: "1px solid #3e568f", color: "#dce7ff", borderRadius: 8, padding: "0.3rem 0.55rem", cursor: "pointer", fontSize: 12 }}
+                    >
+                      Modifier cette tâche
+                    </button>
+                  </div>
+                  {editingTaskId === task.id && (
+                    <div style={{ marginTop: 8, display: "grid", gap: 6, border: "1px solid #3a4a73", padding: 8, borderRadius: 10, background: "#101a30" }}>
+                      <input value={taskDraft.title} onChange={(e) => setTaskDraft((d) => ({ ...d, title: e.target.value }))} style={inputStyle} placeholder="Titre" />
+                      <input type="number" min={5} value={taskDraft.duration} onChange={(e) => setTaskDraft((d) => ({ ...d, duration: Number(e.target.value) }))} style={inputStyle} placeholder="Durée" />
+                      <input value={taskDraft.explanation} onChange={(e) => setTaskDraft((d) => ({ ...d, explanation: e.target.value }))} style={inputStyle} placeholder="Explication" />
+                      <textarea value={taskDraft.microtasksText} onChange={(e) => setTaskDraft((d) => ({ ...d, microtasksText: e.target.value }))} style={{ ...inputStyle, minHeight: 90, resize: "vertical" }} placeholder="Une micro-étape par ligne" />
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button onClick={saveTaskEdit} style={primaryButton}>Enregistrer</button>
+                        <button onClick={() => setEditingTaskId(null)} style={{ ...primaryButton, background: "#384665" }}>Annuler</button>
+                      </div>
+                    </div>
+                  )}
+                  {isTaskBlocked(task) && !done.includes(task.id) && (
+                    <div style={{ marginTop: 6, fontSize: 12, color: "#f2b3ff" }}>Bloquée: termine d&apos;abord la dépendance.</div>
+                  )}
+                  {!isTaskBlocked(task) && !done.includes(task.id) && <div style={{ marginTop: 6, fontSize: 12, color: "#8fd3b6" }}>Prête</div>}
+                  {!!task.depends_on?.length && (
+                    <div style={{ marginTop: 6, fontSize: 12, color: "#ffd38a" }}>
+                      Dépend de: {task.depends_on.join(", ")}
+                    </div>
+                  )}
+                  {task.explanation && <p style={{ margin: "8px 0", color: "#b7c8ee", fontSize: 13 }}>{task.explanation}</p>}
+                  <div style={{ display: "grid", gap: 6 }}>
+                    {(task.microtasks || []).map((micro, idx) => {
+                      const key = `${task.id}-${idx}`;
+                      const checked = doneMicro.includes(key);
+                      return (
+                        <button
+                          key={key}
+                          onClick={() =>
+                            setDoneMicro((prev) => {
+                              if (isTaskBlocked(task) && !done.includes(task.id)) {
+                                return prev;
+                              }
+                              const next = prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key];
+                              const microCount = task.microtasks?.length || 0;
+                              const doneCount = Array.from({ length: microCount }).filter((_, i) => next.includes(`${task.id}-${i}`)).length;
+                              setDone((prevDone) => {
+                                if (doneCount === microCount && microCount > 0) {
+                                  return prevDone.includes(task.id) ? prevDone : [...prevDone, task.id];
+                                }
+                                if (prevDone.includes(task.id)) {
+                                  return prevDone.filter((id) => id !== task.id);
+                                }
+                                return prevDone;
+                              });
+                              return next;
+                            })
+                          }
+                          style={{ background: "#131c33", border: "1px solid #2d3f66", borderRadius: 8, color: checked ? "#8bbd9c" : "#d6e3ff", textAlign: "left", padding: "0.45rem 0.55rem", cursor: "pointer", textDecoration: checked ? "line-through" : "none" }}
+                        >
+                          {checked ? "☑" : "☐"} {micro}
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
               ))}
             </div>
+            <button onClick={submitScore} style={{ ...primaryButton, marginTop: 12 }}>Calculer le score</button>
+          </div>
+        )}
 
-            <div style={{ marginTop: 16, background: "#1A1917", borderRadius: 14, padding: 16, border: "1px solid rgba(245,240,232,0.08)" }}>
-              <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 12 }}>Semaine en cours</div>
-              <div style={{ display: "flex", gap: 8 }}>
-                {dayNames.map((day, i) => {
-                  const isToday = i === today;
-                  const isDone = weekPattern[i] && i < today;
-                  return (
-                    <div key={day} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
-                      <div style={{ width: 32, height: 32, borderRadius: "50%", background: isDone ? "#FF4D1C" : "#2E2D2A", border: isToday ? "2px solid #FF4D1C" : "1px solid rgba(245,240,232,0.08)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14 }}>
-                        {isDone ? "✓" : ""}
-                      </div>
-                      <div style={{ fontSize: 10, color: "#8A8680" }}>{day}</div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div style={{ marginTop: 12, background: "rgba(255,77,28,0.1)", border: "1px solid rgba(255,77,28,0.25)", borderRadius: 14, padding: 16, display: "flex", alignItems: "center", gap: 12 }}>
-              <div style={{ fontSize: 28 }}>🏆</div>
-              <div>
-                <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 2 }}>Défi du jour</div>
-                <div style={{ fontSize: 12, color: "#8A8680" }}>Complète 3 tâches sans pause &gt; 5 min</div>
-              </div>
+        {tab === "analytics" && (
+          <div style={panelStyle}>
+            <div style={statsGrid}>
+              <div style={statCard}><strong>{tasks.length}</strong><span>Tâches générées</span></div>
+              <div style={statCard}><strong>{doneMicro.length}</strong><span>Sous-tâches cochées</span></div>
+              <div style={statCard}><strong>{progress}%</strong><span>Progression</span></div>
             </div>
           </div>
         )}
-      </div>
-
-      {/* CHAT INPUT (fixed bottom) */}
-      {tab === "chat" && (
-        <div style={{ position: "fixed", bottom: 0, left: "50%", transform: "translateX(-50%)", width: "100%", maxWidth: 480, padding: "12px 20px 20px", background: "#0F0E0C", borderTop: "1px solid rgba(245,240,232,0.08)", display: "flex", gap: 10, alignItems: "flex-end" }}>
-          <textarea
-            value={chatInput}
-            onChange={(e) => setChatInput(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendToCoach(chatInput); } }}
-            placeholder="Dis-moi ce que tu veux faire..."
-            rows={1}
-            style={{ flex: 1, background: "#1A1917", border: "1px solid rgba(245,240,232,0.08)", borderRadius: 20, padding: "12px 16px", color: "#F5F0E8", fontFamily: "'DM Sans', sans-serif", fontSize: 14, resize: "none", minHeight: 44, maxHeight: 120 }}
-          />
-          <button
-            className="send-btn"
-            onClick={() => sendToCoach(chatInput)}
-            style={{ width: 44, height: 44, borderRadius: "50%", background: "#FF4D1C", border: "none", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, transition: "transform 0.15s" }}
-          >
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="white"><path d="M2 21l21-9L2 3v7l15 2-15 2v7z" /></svg>
-          </button>
-        </div>
-      )}
-
-      <style>{`
-        @keyframes blink {
-          0%, 80%, 100% { opacity: 0.2; }
-          40% { opacity: 1; }
-        }
-      `}</style>
+      </section>
     </main>
   );
 }
+
+const authWrapper: CSSProperties = { minHeight: "100vh", display: "grid", gridTemplateColumns: "1.2fr 1fr", background: "radial-gradient(circle at 15% 20%, #2b1f56 0%, #11172a 45%, #0a0f1f 100%)", color: "#f5f8ff", padding: "2.3rem", gap: "1.5rem" };
+const authHero: CSSProperties = { display: "flex", flexDirection: "column", justifyContent: "center", padding: "2rem", borderRadius: 18, background: "linear-gradient(160deg, rgba(87,124,255,0.2), rgba(68,197,255,0.08))", border: "1px solid #324772" };
+const authCard: CSSProperties = { alignSelf: "center", padding: "1.2rem", borderRadius: 18, background: "rgba(14, 21, 38, 0.92)", border: "1px solid #2f4169" };
+const dashboardWrapper: CSSProperties = { minHeight: "100vh", display: "grid", gridTemplateColumns: "260px 1fr", background: "linear-gradient(160deg,#090f1f,#0f1730)", color: "#ecf3ff" };
+const sidebar: CSSProperties = { padding: "1rem", borderRight: "1px solid #2f3c5f", display: "flex", flexDirection: "column", gap: 10, background: "rgba(11,18,34,0.95)" };
+const content: CSSProperties = { padding: "1.2rem" };
+const topbar: CSSProperties = { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" };
+const statusBadge: CSSProperties = { background: "#17203b", border: "1px solid #344569", borderRadius: 999, padding: "0.4rem 0.8rem", color: "#aac2ff", fontSize: 13 };
+const panelStyle: CSSProperties = { border: "1px solid #2d3c62", borderRadius: 16, background: "rgba(13,19,37,0.92)", padding: "1rem" };
+const inputStyle: CSSProperties = { border: "1px solid #33466f", background: "#131d34", borderRadius: 10, color: "#f5f8ff", padding: "0.67rem 0.75rem", width: "100%" };
+const primaryButton: CSSProperties = { border: "none", borderRadius: 10, background: "linear-gradient(90deg,#557cff,#7f58ff)", color: "white", padding: "0.65rem 0.95rem", cursor: "pointer" };
+const tabButton: CSSProperties = { flex: 1, borderRadius: 8, border: "1px solid #32456f", background: "#16223f", color: "#dce7ff", padding: "0.55rem" };
+const activeTab: CSSProperties = { background: "linear-gradient(90deg,#506ffe,#7652f7)" };
+const menuItem: CSSProperties = { borderRadius: 10, border: "1px solid #2f3f64", background: "#121d35", color: "#dbe7ff", textAlign: "left", padding: "0.7rem 0.75rem", cursor: "pointer" };
+const activeMenuItem: CSSProperties = { background: "linear-gradient(90deg,#4e6dff,#724ef4)" };
+const chatArea: CSSProperties = { height: 420, overflow: "auto", display: "flex", flexDirection: "column", gap: 10, marginBottom: 12 };
+const chatBubble: CSSProperties = { maxWidth: "70%", borderRadius: 12, padding: "0.7rem 0.8rem", border: "1px solid #364a7a" };
+const taskItem: CSSProperties = { border: "1px solid #33456f", borderRadius: 10, color: "white", textAlign: "left", padding: "0.7rem", cursor: "pointer" };
+const statsGrid: CSSProperties = { display: "grid", gridTemplateColumns: "repeat(3,minmax(0,1fr))", gap: 10 };
+const statCard: CSSProperties = { display: "flex", flexDirection: "column", gap: 4, borderRadius: 12, border: "1px solid #304268", background: "#131d34", padding: "1rem" };
+const pillStyle: CSSProperties = { border: "1px solid #3e5380", borderRadius: 999, padding: "0.35rem 0.7rem", color: "#a8bded", fontSize: 13 };
