@@ -1,0 +1,6 @@
+#!/home/wabi-lat/Perso/Hackaton_poc/hackathon_poc/src/back-end/procast/bin/python3.12
+import sys
+from httpx import main
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(main())

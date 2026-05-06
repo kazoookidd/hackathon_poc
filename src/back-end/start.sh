@@ -38,4 +38,4 @@ echo ""
 echo "🌐 API disponible sur : http://localhost:8000"
 echo "📖 Docs Swagger      : http://localhost:8000/docs"
 echo ""
-uvicorn app:app --reload
+uvicorn main:app --reload
